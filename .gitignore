@@ -1,0 +1,54 @@
+# ── Data cache (raw downloaded OHLCV parquet files) ───────────────────────────
+# These are large binary files regenerated automatically on first run.
+# Do NOT commit — each user fetches their own via yfinance.
+~/crypto-data/
+*.parquet
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+*.egg
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursor/
+
+# ── Reports (generated output — excluded to keep repo clean) ──────────────────
+# Charts and sweep CSVs are large/binary; regenerate with run_charts.py / param_sweep.py
+reports/charts/
+reports/*.csv
+# Keep markdown reports (they're small and useful for tracking history)
+!reports/*.md
+
+# ── Notebooks checkpoints ─────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Secrets / keys ────────────────────────────────────────────────────────────
+.env
+config.env
+*.key
+secrets.*
