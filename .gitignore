@@ -39,7 +39,6 @@ ENV/
 
 # ── Reports (generated output — excluded to keep repo clean) ──────────────────
 # Charts and sweep CSVs are large/binary; regenerate with run_charts.py / param_sweep.py
-reports/charts/
 reports/*.csv
 # Keep markdown reports (they're small and useful for tracking history)
 !reports/*.md

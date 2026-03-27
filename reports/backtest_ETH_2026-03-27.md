@@ -78,7 +78,7 @@
 
 ## Caveats
 
-- Power-law exponent is fit on all available data (look-ahead in the curve itself).
+- Power-law exponent is fit on all available data (look-ahead in the curve itself). Use `--walk-forward` to eliminate this.
 - Z-score uses a rolling trailing window — no look-ahead in signal generation.
 - No tax, funding costs, or borrow fees for shorts modelled.
 - Past performance of a mean-reversion model in a trending asset is not indicative of future results.
