@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
                    help="Enable ML overlay (logistic classifier gates trade entries)")
     p.add_argument("--ml-threshold",  type=float, default=0.55,
                    help="Minimum ML confidence to enter a trade (0-1)")
+    p.add_argument("--hold-through-cycle", action="store_true",
+                   help="Buy on deep Z signal, hold until overbought (Z > sell_thresh) rather than exiting on mean-reversion")
     p.add_argument("--out",           default=None,
                    help="Path to write markdown report (default: reports/backtest_<SYMBOL>_<DATE>.md)")
     return p.parse_args()
@@ -104,6 +106,7 @@ def _override_cfg(args: argparse.Namespace) -> types.ModuleType:
     overrides.SLIPPAGE             = args.slippage
     overrides.INITIAL_CAPITAL      = args.capital
     overrides.LONG_ONLY            = not args.long_short
+    overrides.HOLD_THROUGH_CYCLE   = args.hold_through_cycle
     overrides.USE_TREND_FILTER     = not args.no_trend
     overrides.USE_VOLUME_FILTER    = not args.no_volume
     overrides.USE_MACRO_FILTER     = not args.no_macro
@@ -131,10 +134,12 @@ def build_report(
       f"**Z-score window:** {run_cfg.ZSCORE_WINDOW}d  ·  "
       f"**Buy threshold:** {run_cfg.BUY_THRESHOLD}  ·  "
       f"**Sell threshold:** {run_cfg.SELL_THRESHOLD}")
+    hold_mode = getattr(run_cfg, "HOLD_THROUGH_CYCLE", False)
     A(f"**Filters:** trend={'ON' if run_cfg.USE_TREND_FILTER else 'OFF'}  "
       f"volume={'ON' if run_cfg.USE_VOLUME_FILTER else 'OFF'}  "
       f"macro={'ON' if run_cfg.USE_MACRO_FILTER else 'OFF'}  ·  "
-      f"**Mode:** {'Long/Short' if not run_cfg.LONG_ONLY else 'Long-Only'}")
+      f"**Mode:** {'Long/Short' if not run_cfg.LONG_ONLY else 'Long-Only'}"
+      + ("  ·  **Hold-Through-Cycle: ON**" if hold_mode else ""))
     A(f"**Fees:** {run_cfg.FEE_RATE*100:.2f}%  ·  "
       f"**Slippage:** {run_cfg.SLIPPAGE*100:.2f}%  ·  "
       f"**Starting capital:** ${run_cfg.INITIAL_CAPITAL:,.0f}")

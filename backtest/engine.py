@@ -102,9 +102,10 @@ def build_features(
 
     # ── Filters ───────────────────────────────────────────────────────────────
     filters = build_filter_frame(out["close"], out["volume"], cfg)
-    out["trend"]     = filters["trend"]
-    out["volume_ok"] = filters["volume_ok"]
-    out["macro_ok"]  = filters["macro_ok"]
+    out["trend"]      = filters["trend"]
+    out["trend_mult"] = filters["trend_mult"]
+    out["volume_ok"]  = filters["volume_ok"]
+    out["macro_ok"]   = filters["macro_ok"]
 
     # ── Target position (continuous, range [-1, 1]) ───────────────────────────
     out["target_position"] = _compute_target_position(out, cfg)
@@ -167,13 +168,17 @@ def _compute_target_position(df: pd.DataFrame, cfg) -> pd.Series:
     # NaN Z-score → no position
     raw[z.isna()] = 0.0
 
-    # Apply trend filter: block longs in downtrend, block shorts in uptrend
+    # Apply trend filter: scale position by continuous slope multiplier.
+    # trend_mult ≈ 1.0 in strong uptrend, ~0.82 in flat, ~0.07 in strong downtrend.
+    # For short positions the multiplier is inverted (1 - mult) so a downtrend
+    # amplifies shorts rather than suppressing them.
     if cfg.USE_TREND_FILTER:
-        downtrend = df["trend"] < 0
-        uptrend   = df["trend"] > 0
-        raw[(raw > 0) & downtrend] = 0.0  # no longs in downtrend
+        mult = df["trend_mult"].fillna(0.5)
+        longs  = raw > 0
+        shorts = raw < 0
+        raw[longs]  = raw[longs]  * mult[longs]
         if not long_only:
-            raw[(raw < 0) & uptrend] = 0.0  # no shorts in uptrend
+            raw[shorts] = raw[shorts] * (1.0 - mult[shorts])
 
     # Apply volume filter: zero out signal on low-volume days
     if cfg.USE_VOLUME_FILTER:
@@ -241,6 +246,22 @@ def run_backtest(
 
         # ── Rebalance ─────────────────────────────────────────────────────────
         target = float(row["target_position"])
+
+        # Hold-through-cycle mode: override the vectorised continuous target.
+        # Once in a long, stay fully invested until Z turns overbought.
+        # Entries are still gated by the vectorised signal (filters apply).
+        if getattr(cfg, "HOLD_THROUGH_CYCLE", False):
+            z_now = float(row["zscore"]) if not np.isnan(row["zscore"]) else 0.0
+            if position > 0:
+                # In a long — hold unless Z has crossed above sell threshold
+                if z_now > cfg.SELL_THRESHOLD:
+                    target = 0.0          # overbought → exit
+                else:
+                    target = position     # hold at current size
+            elif target > 0:
+                # Not yet in — take a buy signal at full size
+                target = cfg.MAX_POSITION
+
         delta  = target - position
 
         if abs(delta) >= cfg.REBALANCE_BAND:
@@ -403,9 +424,10 @@ def build_features_walk_forward(
 
     # Filters and target position
     filters = build_filter_frame(out["close"], out["volume"], cfg)
-    out["trend"]     = filters["trend"]
-    out["volume_ok"] = filters["volume_ok"]
-    out["macro_ok"]  = filters["macro_ok"]
+    out["trend"]      = filters["trend"]
+    out["trend_mult"] = filters["trend_mult"]
+    out["volume_ok"]  = filters["volume_ok"]
+    out["macro_ok"]   = filters["macro_ok"]
     out["target_position"] = _compute_target_position(out, cfg)
     out["walk_forward"] = True
 

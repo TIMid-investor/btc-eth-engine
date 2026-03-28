@@ -46,6 +46,16 @@ BUY_THRESHOLD  = 1.5        # |Z| must exceed this on the downside  → go long
 SELL_THRESHOLD = 1.5        # |Z| must exceed this on the upside   → go flat / short
 EXIT_THRESHOLD = 0.25       # close the position when |Z| falls inside this band
 
+# ── Hold-through-cycle mode ────────────────────────────────────────────────────
+# When True the backtest ignores continuous Z-score position sizing and instead
+# runs a stateful buy/hold/sell machine:
+#   ENTER  (full MAX_POSITION) when Z drops below -BUY_THRESHOLD  (buy the dip)
+#   HOLD                       while Z is between -BUY_THRESHOLD and SELL_THRESHOLD
+#   EXIT                       when Z rises above  SELL_THRESHOLD (overbought)
+# This captures full bull-market runs (e.g. Aug 2020 → Apr 2021) rather than
+# selling out as Z mean-reverts to zero.  All filters still gate the entry.
+HOLD_THROUGH_CYCLE = False
+
 # ── Filters ────────────────────────────────────────────────────────────────────
 
 USE_TREND_FILTER  = True

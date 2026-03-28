@@ -1,0 +1,17 @@
+# Reddit Sentiment Analysis — Dependencies
+#
+# Install in tiers based on what you want:
+#
+# Tier 1 — Core (required)
+praw>=7.7
+
+# Tier 2 — Better sentiment (strongly recommended)
+vaderSentiment>=3.3
+transformers>=4.35
+torch>=2.1           # or: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Tier 3 — Deep narrative discovery (optional, slower to install)
+bertopic>=0.16
+sentence-transformers>=2.2
+umap-learn>=0.5
+hdbscan>=0.8

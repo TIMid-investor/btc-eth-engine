@@ -4,7 +4,13 @@ models/filters.py — Optional confluence filters.
 Each filter returns a boolean / directional Series that the signal
 generator uses to gate or dampen entry signals.
 
-  trend_filter    — only trade in the direction of the intermediate trend
+  trend_filter      — discrete direction of intermediate trend (+1/0/-1)
+  trend_multiplier  — continuous [0, 1] position-size multiplier based on
+                      normalised EMA slope (sigmoid). Replaces the binary
+                      on/off gate with a smooth gradient:
+                        strong uptrend  → ~1.0 (full size)
+                        flat trend      → ~0.82 (slight reduction)
+                        strong downtrend → ~0.07 (almost zero)
   volume_filter   — weaken signals when volume is below its recent average
   macro_filter    — block signals during severe drawdowns (macro tail events)
 """
@@ -31,6 +37,35 @@ def trend_filter(prices: pd.Series, ema_days: int = 140) -> pd.Series:
     direction = np.sign(slope).fillna(0).astype(int)
     direction.name = "trend"
     return direction
+
+
+def trend_multiplier(prices: pd.Series, ema_days: int = 140) -> pd.Series:
+    """
+    Continuous position-size multiplier based on EMA slope strength.
+
+    Computes the fractional slope of the EMA, normalises it by its own
+    rolling standard deviation (z-scores the slope), then maps through a
+    sigmoid shifted so that a flat slope (slope_z = 0) gives ~0.82 rather
+    than 0.5.  This means:
+
+      strong uptrend   (slope_z ≈ +2) → multiplier ≈ 0.97  (nearly full size)
+      flat trend       (slope_z ≈  0) → multiplier ≈ 0.82  (mild reduction)
+      mild downtrend   (slope_z ≈ -1) → multiplier ≈ 0.67
+      strong downtrend (slope_z ≈ -3) → multiplier ≈ 0.18  (heavily reduced)
+
+    The shift of +1.5 in the exponent centres the "neutral" zone so that
+    only meaningfully negative slopes shrink positions materially, while
+    any positive slope leaves size largely intact.
+
+    Returns Series in [0, 1] named "trend_mult".
+    """
+    ema = prices.ewm(span=ema_days, adjust=False).mean()
+    frac_slope = ema.diff() / ema.shift(1)
+    slope_std  = frac_slope.rolling(window=252, min_periods=30).std()
+    slope_z    = frac_slope / slope_std.replace(0, np.nan)
+    # Sigmoid shifted so slope_z = 0 → mult ≈ 0.82
+    mult = 1.0 / (1.0 + np.exp(-(slope_z + 1.5)))
+    return mult.clip(0, 1).fillna(0.5).rename("trend_mult")
 
 
 # ── Volume filter ──────────────────────────────────────────────────────────────
@@ -96,7 +131,7 @@ def build_filter_frame(
 
     Returns
     -------
-    DataFrame with columns: trend, volume_ok, macro_ok
+    DataFrame with columns: trend, trend_mult, volume_ok, macro_ok
     """
     trend     = trend_filter(prices, ema_days=cfg.TREND_EMA_DAYS)
     volume_ok = volume_filter(volume, window=cfg.VOLUME_WINDOW,
@@ -104,4 +139,11 @@ def build_filter_frame(
     macro_ok  = macro_filter(prices, drawdown_threshold=cfg.MACRO_DD_THRESHOLD,
                              window=cfg.MACRO_DD_WINDOW)
 
-    return pd.DataFrame({"trend": trend, "volume_ok": volume_ok, "macro_ok": macro_ok})
+    trend_mult = trend_multiplier(prices, ema_days=cfg.TREND_EMA_DAYS)
+
+    return pd.DataFrame({
+        "trend":      trend,
+        "trend_mult": trend_mult,
+        "volume_ok":  volume_ok,
+        "macro_ok":   macro_ok,
+    })
