@@ -301,15 +301,42 @@ def main() -> None:
             from data.coingecko_fetcher import fetch_coingecko
             print("    Fetching CoinGecko volume...", end=" ", flush=True)
             cg_df = fetch_coingecko(symbol, end=args.end)
-            # Use CoinGecko total_volume as the volume series
             demand_components["volume_df"] = cg_df[["total_volume"]].rename(
                 columns={"total_volume": "volume"}
             )
             print("done", flush=True)
         except Exception as exc:
             print(f"skipped ({exc})", flush=True)
-            # Fallback: use yfinance volume from main OHLCV
             demand_components["volume_df"] = df
+
+        try:
+            from data.onchain_fetcher import build_onchain_frame
+            print("    Fetching on-chain metrics (CoinMetrics + Blockchain.com)...",
+                  end=" ", flush=True)
+            demand_components["onchain_df"] = build_onchain_frame(
+                symbol, end=args.end
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        try:
+            from data.sentiment_fetcher import fetch_fear_greed
+            print("    Fetching Fear & Greed Index...", end=" ", flush=True)
+            demand_components["fear_greed_df"] = fetch_fear_greed(end=args.end)
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        try:
+            from data.exchange_fetcher import fetch_exchange_volume
+            print("    Fetching multi-exchange volume (ccxt)...", end=" ", flush=True)
+            demand_components["exchange_df"] = fetch_exchange_volume(
+                symbol, end=args.end
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
 
         if demand_components:
             from models.demand_index import build_demand_index

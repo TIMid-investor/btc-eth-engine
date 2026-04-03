@@ -149,13 +149,33 @@ def print_dashboard(symbol: str, n_rows: int = 1, show_demand: bool = False) -> 
         # CoinGecko volume (preferred) or fallback to yfinance
         try:
             from data.coingecko_fetcher import fetch_coingecko
-            cg_sym = "BTC" if symbol == "BTC" else "ETH"
-            cg_df  = fetch_coingecko(cg_sym)
+            cg_df  = fetch_coingecko(symbol)
             demand_components["volume_df"] = cg_df[["total_volume"]].rename(
                 columns={"total_volume": "volume"}
             )
         except Exception:
             demand_components["volume_df"] = df
+
+        # On-chain: CoinMetrics MVRV + active addresses
+        try:
+            from data.onchain_fetcher import build_onchain_frame
+            demand_components["onchain_df"] = build_onchain_frame(symbol)
+        except Exception:
+            pass
+
+        # Fear & Greed Index
+        try:
+            from data.sentiment_fetcher import fetch_fear_greed
+            demand_components["fear_greed_df"] = fetch_fear_greed()
+        except Exception:
+            pass
+
+        # Multi-exchange volume (ccxt)
+        try:
+            from data.exchange_fetcher import fetch_exchange_volume
+            demand_components["exchange_df"] = fetch_exchange_volume(symbol)
+        except Exception:
+            pass
 
         if demand_components:
             try:
@@ -170,12 +190,34 @@ def print_dashboard(symbol: str, n_rows: int = 1, show_demand: bool = False) -> 
                 print(f"    7d EMA:      {d_short:>+.3f}  |  30d EMA: {d_trend:>+.3f}")
                 print(f"    Momentum:    {'↑ Rising' if d_rising else '↓ Falling'}"
                       f"  ({'entry OK' if d_rising else 'entry BLOCKED'})")
-                if "trends_norm" in d.index:
-                    print(f"    Trends:      {d['trends_norm']:>+.2f}σ")
-                if "etf_norm" in d.index:
-                    print(f"    ETF flows:   {d['etf_norm']:>+.2f}σ")
-                if "volume_norm" in d.index:
-                    print(f"    Volume:      {d['volume_norm']:>+.2f}σ")
+                component_labels = {
+                    "trends_norm":      "Google Trends",
+                    "volume_norm":      "Spot volume",
+                    "etf_norm":         "ETF flows",
+                    "mvrv_norm":        "MVRV (inv.)",
+                    "fear_greed_norm":  "Fear & Greed",
+                    "active_addr_norm": "Active addrs",
+                    "exchange_vol_norm":"Exchange vol",
+                }
+                for col, label in component_labels.items():
+                    if col in d.index and not pd.isna(d[col]):
+                        print(f"    {label:<16} {d[col]:>+.2f}σ")
+
+                # Fear & Greed raw score
+                if "fear_greed_df" in demand_components:
+                    fg_df = demand_components["fear_greed_df"]
+                    if not fg_df.empty:
+                        fg_row = fg_df.iloc[-1]
+                        fg_val = int(fg_row.get("fear_greed", 0))
+                        fg_lbl = fg_row.get("fear_greed_label", "")
+                        print(f"    F&G raw:         {fg_val}/100 ({fg_lbl})")
+
+                # MVRV if available
+                onchain_df = demand_components.get("onchain_df")
+                if onchain_df is not None and "mvrv" in onchain_df.columns:
+                    mvrv_val = float(onchain_df["mvrv"].dropna().iloc[-1])
+                    print(f"    MVRV:            {mvrv_val:.2f}"
+                          f"  {'⚠ HIGH' if mvrv_val > 3.5 else '✓ OK'}")
             except Exception as exc:
                 print(f"    Error building demand index: {exc}")
         else:

@@ -49,11 +49,14 @@ import pandas as pd
 # ── Default weights (mirrored in config.py) ────────────────────────────────────
 
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "trends":   0.25,   # Google Trends composite (attention)
-    "volume":   0.25,   # Spot volume vs rolling avg (action)
-    "mvrv":     0.20,   # MVRV Z-score (intent) — 0 if unavailable
-    "etf":      0.20,   # ETF dollar volume (institutional action)
-    "outflows": 0.10,   # Exchange outflows (accumulation intent) — 0 if unavailable
+    "trends":      0.20,   # Google Trends composite (attention)
+    "volume":      0.15,   # Spot volume vs rolling avg (action)
+    "mvrv":        0.15,   # MVRV Z-score inverted (intent) — 0 if unavailable
+    "etf":         0.15,   # ETF dollar volume (institutional action)
+    "outflows":    0.05,   # Exchange outflows (accumulation intent) — 0 if unavailable
+    "fear_greed":  0.15,   # Fear & Greed Index momentum (sentiment)
+    "active_addr": 0.10,   # Active addresses (adoption/network usage)
+    "exchange_vol":0.05,   # Multi-exchange aggregated volume (ccxt)
 }
 
 _NORM_WINDOW  = 90    # rolling Z-score window for each component
@@ -65,35 +68,37 @@ _CLIP_SIGMA   = 3.0   # clip normalized values to [-3, +3]
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def build_demand_index(
-    trends_df:   pd.DataFrame | None = None,
-    volume_df:   pd.DataFrame | None = None,
-    etf_df:      pd.DataFrame | None = None,
-    mvrv_df:     pd.DataFrame | None = None,
-    outflows_df: pd.DataFrame | None = None,
-    weights:     dict[str, float] | None = None,
-    norm_window: int = _NORM_WINDOW,
+    trends_df:    pd.DataFrame | None = None,
+    volume_df:    pd.DataFrame | None = None,
+    etf_df:       pd.DataFrame | None = None,
+    mvrv_df:      pd.DataFrame | None = None,
+    outflows_df:  pd.DataFrame | None = None,
+    fear_greed_df:pd.DataFrame | None = None,
+    onchain_df:   pd.DataFrame | None = None,
+    exchange_df:  pd.DataFrame | None = None,
+    weights:      dict[str, float] | None = None,
+    norm_window:  int = _NORM_WINDOW,
 ) -> pd.DataFrame:
     """
     Build the composite demand index from available data sources.
 
     Parameters
     ----------
-    trends_df   : DataFrame from ``fetch_trends_composite()``.
-                  Must have a ``composite`` column (0-100 scale, daily).
-    volume_df   : OHLCV DataFrame from ``fetch_ohlcv()``.
-                  Must have ``close`` and ``volume`` columns.
-    etf_df      : DataFrame from ``fetch_etf_flows()``.
-                  Must have ``total_etf_volume`` column.
-    mvrv_df     : Optional. DataFrame with ``mvrv`` column (on-chain).
-    outflows_df : Optional. DataFrame with ``outflows`` column (on-chain).
-    weights     : Override default component weights.  Will be renormalized
-                  to sum to 1.0 automatically.
-    norm_window : Rolling window (days) for Z-score normalization.
+    trends_df     : from ``fetch_trends_composite()`` — needs ``composite`` col
+    volume_df     : OHLCV or CoinGecko df — needs ``volume`` (or ``total_volume``) col
+    etf_df        : from ``fetch_etf_flows()`` — needs ``total_etf_volume`` col
+    mvrv_df       : on-chain df with ``mvrv`` column (inverted: high MVRV = exit)
+    outflows_df   : on-chain df with ``outflows`` column
+    fear_greed_df : from ``fetch_fear_greed()`` — needs ``fear_greed`` col (0-100)
+    onchain_df    : from ``build_onchain_frame()`` — used for active_addresses + mvrv
+    exchange_df   : from ``fetch_exchange_volume()`` — needs ``total_exchange_volume``
+    weights       : override default component weights (auto-renormalized)
+    norm_window   : rolling Z-score window in days
 
     Returns
     -------
     DataFrame with columns:
-      trends_norm, volume_norm, mvrv_norm, etf_norm, outflows_norm
+      <component>_norm (each normalized input),
       demand_raw, demand_short, demand_trend, demand_rising
     """
     weights = dict(weights or DEFAULT_WEIGHTS)
@@ -106,35 +111,68 @@ def build_demand_index(
     else:
         weights["trends"] = 0.0
 
-    # ── C. Action: Spot volume (volume ratio vs 90-day rolling avg) ────────────
-    if volume_df is not None and "volume" in volume_df.columns:
-        vol = volume_df["volume"].astype(float)
-        # Dollar volume preferred; fall back to raw volume
-        if "close" in volume_df.columns:
-            vol = vol * volume_df["close"].astype(float)
-        components["volume"] = vol
+    # ── C. Action: Spot volume ─────────────────────────────────────────────────
+    vol_series = None
+    if volume_df is not None:
+        if "total_volume" in volume_df.columns:
+            vol_series = volume_df["total_volume"].astype(float)
+        elif "volume" in volume_df.columns:
+            vol_series = volume_df["volume"].astype(float)
+            if "close" in volume_df.columns:
+                vol_series = vol_series * volume_df["close"].astype(float)
+    if vol_series is not None:
+        components["volume"] = vol_series
     else:
         weights["volume"] = 0.0
 
-    # ── B. Intent: MVRV Z-score (on-chain, optional) ──────────────────────────
-    if mvrv_df is not None and "mvrv" in mvrv_df.columns:
-        # MVRV is already a ratio-like metric; we'll normalize it like others.
-        # Invert sign: high MVRV = overbought = LOW demand score
-        components["mvrv"] = -mvrv_df["mvrv"].astype(float)
+    # ── B. Intent: MVRV (on-chain) — prefer onchain_df, fall back to mvrv_df ──
+    mvrv_series = None
+    if onchain_df is not None and "mvrv" in onchain_df.columns:
+        mvrv_series = onchain_df["mvrv"].astype(float)
+    elif mvrv_df is not None and "mvrv" in mvrv_df.columns:
+        mvrv_series = mvrv_df["mvrv"].astype(float)
+    if mvrv_series is not None:
+        # Invert: high MVRV = overbought = low demand score
+        components["mvrv"] = -mvrv_series
     else:
         weights["mvrv"] = 0.0
 
-    # ── C. Action: ETF flows (institutional, optional) ────────────────────────
+    # ── C. Action: ETF flows ───────────────────────────────────────────────────
     if etf_df is not None and "total_etf_volume" in etf_df.columns:
         components["etf"] = etf_df["total_etf_volume"].astype(float)
     else:
         weights["etf"] = 0.0
 
-    # ── B. Intent: Exchange outflows (accumulation proxy, optional) ───────────
+    # ── B. Intent: Exchange outflows ───────────────────────────────────────────
     if outflows_df is not None and "outflows" in outflows_df.columns:
         components["outflows"] = outflows_df["outflows"].astype(float)
     else:
         weights["outflows"] = 0.0
+
+    # ── A. Attention: Fear & Greed Index ──────────────────────────────────────
+    if fear_greed_df is not None and "fear_greed" in fear_greed_df.columns:
+        # Use raw score (0-100); Z-score normalization handles scaling
+        components["fear_greed"] = fear_greed_df["fear_greed"].astype(float)
+    else:
+        weights["fear_greed"] = 0.0
+
+    # ── B. Intent: Active addresses (adoption proxy) ───────────────────────────
+    addr_series = None
+    if onchain_df is not None:
+        for col in ("active_addresses", "btc_active_addresses", "eth_daily_tx_count"):
+            if col in onchain_df.columns:
+                addr_series = onchain_df[col].astype(float)
+                break
+    if addr_series is not None:
+        components["active_addr"] = addr_series
+    else:
+        weights["active_addr"] = 0.0
+
+    # ── C. Action: Multi-exchange aggregated volume ────────────────────────────
+    if exchange_df is not None and "total_exchange_volume" in exchange_df.columns:
+        components["exchange_vol"] = exchange_df["total_exchange_volume"].astype(float)
+    else:
+        weights["exchange_vol"] = 0.0
 
     if not components:
         raise ValueError(
