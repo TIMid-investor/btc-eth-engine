@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum ML confidence to enter a trade (0-1)")
     p.add_argument("--out",           default=None,
                    help="Path to write markdown report (default: reports/backtest_<SYMBOL>_<DATE>.md)")
+    p.add_argument("--taxes",          action="store_true",
+                   help="Apply capital gains tax modeling (short-term 37%%, long-term 20%%)")
+    p.add_argument("--tax-short",      type=float, default=0.37,
+                   help="Short-term capital gains rate (held < 1 year)")
+    p.add_argument("--tax-long",       type=float, default=0.20,
+                   help="Long-term capital gains rate (held >= 1 year)")
     p.add_argument("--no-t1",          action="store_true",
                    help="Disable T+1 execution delay (execute at same-bar close, legacy behaviour)")
     p.add_argument("--demand",         action="store_true",
@@ -389,6 +395,22 @@ def main() -> None:
                         bench_label="Buy & Hold"))
 
     print(f"\n  Closed trades: {len(trades)}")
+
+    # ── Tax modeling (optional) ──────────────────────────────────────────────
+    if args.taxes and not trades.empty:
+        from backtest.tax import apply_taxes, tax_summary
+        print(f"\n  Applying tax model "
+              f"(ST={args.tax_short*100:.0f}%, LT={args.tax_long*100:.0f}%)...",
+              flush=True)
+        after_tax_equity, tax_log = apply_taxes(
+            equity, trades,
+            initial_capital=run_cfg.INITIAL_CAPITAL,
+            short_term_rate=args.tax_short,
+            long_term_rate=args.tax_long,
+        )
+        print(f"\n{tax_summary(equity, after_tax_equity, bah, tax_log,
+                               run_cfg.INITIAL_CAPITAL,
+                               args.tax_short, args.tax_long)}")
 
     # ── Save report ──────────────────────────────────────────────────────────
     out_path = Path(args.out) if args.out else (

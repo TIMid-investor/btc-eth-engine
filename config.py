@@ -86,6 +86,12 @@ START_DATE      = "2016-01-01"
 # more realistic for EOD strategies. Disable with --no-t1 for comparison.
 T_PLUS_ONE = True
 
+# ── Tax modeling ──────────────────────────────────────────────────────────────
+
+APPLY_TAXES      = False   # off by default; enable with --taxes flag
+TAX_SHORT_TERM   = 0.37    # federal + typical state rate for < 1 year
+TAX_LONG_TERM    = 0.20    # federal + typical state rate for >= 1 year
+
 # ── Demand index ───────────────────────────────────────────────────────────────
 
 # Enable demand-layer filters in the strategy
