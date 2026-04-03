@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum ML confidence to enter a trade (0-1)")
     p.add_argument("--out",           default=None,
                    help="Path to write markdown report (default: reports/backtest_<SYMBOL>_<DATE>.md)")
+    p.add_argument("--demand",         action="store_true",
+                   help="Enable demand-layer filters (Google Trends + ETF flows)")
+    p.add_argument("--demand-entry",   action="store_true",
+                   help="Gate entries: only enter when demand is rising")
+    p.add_argument("--demand-exit",    action="store_true",
+                   help="Enhance exits: exit early when demand peaks and rolls over")
     return p.parse_args()
 
 
@@ -107,6 +113,8 @@ def _override_cfg(args: argparse.Namespace) -> types.ModuleType:
     overrides.USE_TREND_FILTER     = not args.no_trend
     overrides.USE_VOLUME_FILTER    = not args.no_volume
     overrides.USE_MACRO_FILTER     = not args.no_macro
+    overrides.USE_DEMAND_FILTER    = args.demand or args.demand_entry
+    overrides.USE_DEMAND_EXIT      = args.demand or args.demand_exit
     return overrides
 
 
@@ -248,6 +256,45 @@ def main() -> None:
     df = fetch_ohlcv(yf_symbol, start="2014-01-01", end=args.end)
     print(f"  {len(df)} trading days  ({df.index[0].date()} → {df.index[-1].date()})")
 
+    # ── Demand layer (optional) ──────────────────────────────────────────────
+    demand_df = None
+    use_demand = args.demand or args.demand_entry or args.demand_exit
+    if use_demand:
+        print(f"\n  Building demand index...", flush=True)
+        demand_components: dict = {}
+        try:
+            from data.trends_fetcher import fetch_trends_composite
+            print("    Fetching Google Trends...", end=" ", flush=True)
+            demand_components["trends_df"] = fetch_trends_composite(
+                start="2014-01-01", end=args.end,
+                geo=getattr(run_cfg, "TRENDS_GEO", ""),
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        try:
+            from data.etf_flows_fetcher import fetch_etf_flows
+            print("    Fetching ETF flows...", end=" ", flush=True)
+            demand_components["etf_df"] = fetch_etf_flows(end=args.end)
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        # volume_df: use main price data (df has close + volume)
+        demand_components["volume_df"] = df
+
+        if demand_components:
+            from models.demand_index import build_demand_index
+            demand_df = build_demand_index(**demand_components)
+            d_latest = demand_df.iloc[-1]
+            print(f"  Demand index built: {len(demand_df)} days  "
+                  f"raw={d_latest.get('demand_raw', float('nan')):.2f}  "
+                  f"rising={'Yes' if d_latest.get('demand_rising', 0) else 'No'}")
+        else:
+            print("  No demand components available — skipping demand layer.")
+            use_demand = False
+
     use_regime = args.regime
 
     if walk_forward:
@@ -256,6 +303,19 @@ def main() -> None:
             df, genesis_date=genesis, cfg=run_cfg,
             refit_months=args.refit_months,
         )
+        # Demand layer is applied after walk-forward feature build
+        if demand_df is not None:
+            from backtest.engine import _compute_target_position
+            demand_aligned = demand_df.reindex(features.index)
+            if "demand_rising" in demand_df.columns:
+                features["demand_rising"] = demand_aligned["demand_rising"].fillna(1)
+            if "demand_short" in demand_df.columns:
+                features["demand_short"] = demand_aligned["demand_short"]
+            if "demand_trend" in demand_df.columns:
+                features["demand_trend"] = demand_aligned["demand_trend"]
+            if "demand_raw" in demand_df.columns:
+                features["demand_raw"] = demand_aligned["demand_raw"]
+            features["target_position"] = _compute_target_position(features, run_cfg)
         print(f"  {features['curve_fit_date'].nunique()} unique curve fits applied")
         if use_regime:
             # Apply regime layer on top of walk-forward features
@@ -274,7 +334,7 @@ def main() -> None:
         print(f"  Building features ({run_cfg.CURVE_MODEL} curve"
               + (", regime-aware" if use_regime else "") + ")...", flush=True)
         features = build_features(df, genesis_date=genesis, cfg=run_cfg,
-                                  use_regime=use_regime)
+                                  use_regime=use_regime, demand_df=demand_df)
         if run_cfg.CURVE_MODEL == "power_law" and not walk_forward:
             from models.power_law import fit_power_law as _fp
             params = _fp(features["close"], genesis)

@@ -53,7 +53,7 @@ from models.power_law import (
     log_deviation,
 )
 from models.zscore import rolling_zscore
-from models.filters import build_filter_frame
+from models.filters import build_filter_frame, demand_entry_filter, demand_exit_filter
 from models.regime import build_regime_frame, apply_regime_to_target
 
 
@@ -64,6 +64,7 @@ def build_features(
     genesis_date: str,
     cfg=_default_cfg,
     use_regime: bool = False,
+    demand_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Enrich the raw OHLCV DataFrame with all model features.
@@ -105,6 +106,18 @@ def build_features(
     out["trend"]     = filters["trend"]
     out["volume_ok"] = filters["volume_ok"]
     out["macro_ok"]  = filters["macro_ok"]
+
+    # ── Demand index (optional) ───────────────────────────────────────────────
+    if demand_df is not None:
+        demand_aligned = demand_df.reindex(out.index)
+        if "demand_rising" in demand_df.columns:
+            out["demand_rising"] = demand_aligned["demand_rising"].fillna(1)
+        if "demand_short" in demand_df.columns:
+            out["demand_short"] = demand_aligned["demand_short"]
+        if "demand_trend" in demand_df.columns:
+            out["demand_trend"] = demand_aligned["demand_trend"]
+        if "demand_raw" in demand_df.columns:
+            out["demand_raw"] = demand_aligned["demand_raw"]
 
     # ── Target position (continuous, range [-1, 1]) ───────────────────────────
     out["target_position"] = _compute_target_position(out, cfg)
@@ -184,6 +197,19 @@ def _compute_target_position(df: pd.DataFrame, cfg) -> pd.Series:
     if cfg.USE_MACRO_FILTER:
         shock = ~df["macro_ok"].fillna(True)
         raw[shock] = 0.0
+
+    # Apply demand entry filter: block new longs when demand is falling
+    if getattr(cfg, "USE_DEMAND_FILTER", False) and "demand_rising" in df.columns:
+        demand_ok = demand_entry_filter(df["demand_rising"])
+        # Only suppress *new* entries (raw > 0 when previously flat/no signal)
+        raw[(raw > 0) & ~demand_ok] = 0.0
+
+    # Apply demand exit filter: force early exit when demand peaks and rolls over
+    if getattr(cfg, "USE_DEMAND_EXIT", False) and \
+            "demand_short" in df.columns and "demand_trend" in df.columns:
+        rolling_over = demand_exit_filter(df["demand_short"], df["demand_trend"])
+        # Exit any long position on demand rollover days
+        raw[(raw > 0) & rolling_over] = 0.0
 
     raw.name = "target_position"
     return raw

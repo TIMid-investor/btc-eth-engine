@@ -79,7 +79,7 @@ def _filter_icon(val: bool | int | None) -> str:
 
 # ── Per-symbol dashboard ───────────────────────────────────────────────────────
 
-def print_dashboard(symbol: str, n_rows: int = 1) -> None:
+def print_dashboard(symbol: str, n_rows: int = 1, show_demand: bool = False) -> None:
     yf_symbol = cfg.BTC_SYMBOL if symbol == "BTC" else cfg.ETH_SYMBOL
     genesis   = cfg.BTC_GENESIS if symbol == "BTC" else cfg.ETH_GENESIS
 
@@ -128,6 +128,50 @@ def print_dashboard(symbol: str, n_rows: int = 1) -> None:
     print(f"    Macro OK:                {'Yes ✓' if macro_ok else 'No — shock drawdown'}"
           + ("" if cfg.USE_MACRO_FILTER else "  [disabled]"))
 
+    # Demand index (optional)
+    if show_demand:
+        print(f"")
+        print(f"  Demand Index:")
+        demand_df = None
+        demand_components: dict = {}
+        try:
+            from data.trends_fetcher import fetch_trends_composite
+            demand_components["trends_df"] = fetch_trends_composite()
+        except Exception as exc:
+            print(f"    Google Trends: unavailable ({exc})")
+
+        try:
+            from data.etf_flows_fetcher import fetch_etf_flows
+            demand_components["etf_df"] = fetch_etf_flows()
+        except Exception as exc:
+            print(f"    ETF flows: unavailable ({exc})")
+
+        demand_components["volume_df"] = df
+
+        if demand_components:
+            try:
+                from models.demand_index import build_demand_index
+                demand_df = build_demand_index(**demand_components)
+                d = demand_df.iloc[-1]
+                d_raw     = d.get("demand_raw", float("nan"))
+                d_short   = d.get("demand_short", float("nan"))
+                d_trend   = d.get("demand_trend", float("nan"))
+                d_rising  = bool(d.get("demand_rising", 0))
+                print(f"    Raw score:   {d_raw:>+.3f}  {_bar(d_raw)}")
+                print(f"    7d EMA:      {d_short:>+.3f}  |  30d EMA: {d_trend:>+.3f}")
+                print(f"    Momentum:    {'↑ Rising' if d_rising else '↓ Falling'}"
+                      f"  ({'entry OK' if d_rising else 'entry BLOCKED'})")
+                if "trends_norm" in d.index:
+                    print(f"    Trends:      {d['trends_norm']:>+.2f}σ")
+                if "etf_norm" in d.index:
+                    print(f"    ETF flows:   {d['etf_norm']:>+.2f}σ")
+                if "volume_norm" in d.index:
+                    print(f"    Volume:      {d['volume_norm']:>+.2f}σ")
+            except Exception as exc:
+                print(f"    Error building demand index: {exc}")
+        else:
+            print(f"    No data sources available.")
+
     # Curve fit summary
     if cfg.CURVE_MODEL == "power_law":
         params = fit_power_law(features["close"], genesis)
@@ -162,6 +206,8 @@ def parse_args() -> argparse.Namespace:
                    help="Show only this asset (default: both)")
     p.add_argument("--days",   type=int, default=1,
                    help="Show last N days of signals in the table")
+    p.add_argument("--demand", action="store_true",
+                   help="Show demand index (Google Trends + ETF flows)")
     return p.parse_args()
 
 
@@ -170,7 +216,7 @@ def main() -> None:
     symbols = [args.symbol] if args.symbol else ["BTC", "ETH"]
     print(f"\n  Crypto Signal Dashboard — {date.today()}")
     for sym in symbols:
-        print_dashboard(sym, n_rows=args.days)
+        print_dashboard(sym, n_rows=args.days, show_demand=args.demand)
     print()
 
 
