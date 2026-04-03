@@ -79,6 +79,13 @@ FEE_RATE        = 0.001     # 0.10% per trade (one-way)
 SLIPPAGE        = 0.0005    # 0.05% per trade (one-way)
 START_DATE      = "2016-01-01"
 
+# ── Execution realism ──────────────────────────────────────────────────────────
+
+# Execute at next bar's open (T+1) instead of same-bar close.
+# Eliminates look-ahead on execution price; reduces CAGR slightly but is
+# more realistic for EOD strategies. Disable with --no-t1 for comparison.
+T_PLUS_ONE = True
+
 # ── Demand index ───────────────────────────────────────────────────────────────
 
 # Enable demand-layer filters in the strategy

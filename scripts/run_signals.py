@@ -146,7 +146,16 @@ def print_dashboard(symbol: str, n_rows: int = 1, show_demand: bool = False) -> 
         except Exception as exc:
             print(f"    ETF flows: unavailable ({exc})")
 
-        demand_components["volume_df"] = df
+        # CoinGecko volume (preferred) or fallback to yfinance
+        try:
+            from data.coingecko_fetcher import fetch_coingecko
+            cg_sym = "BTC" if symbol == "BTC" else "ETH"
+            cg_df  = fetch_coingecko(cg_sym)
+            demand_components["volume_df"] = cg_df[["total_volume"]].rename(
+                columns={"total_volume": "volume"}
+            )
+        except Exception:
+            demand_components["volume_df"] = df
 
         if demand_components:
             try:

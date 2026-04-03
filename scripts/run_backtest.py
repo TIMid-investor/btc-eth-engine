@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
                    help="Minimum ML confidence to enter a trade (0-1)")
     p.add_argument("--out",           default=None,
                    help="Path to write markdown report (default: reports/backtest_<SYMBOL>_<DATE>.md)")
+    p.add_argument("--no-t1",          action="store_true",
+                   help="Disable T+1 execution delay (execute at same-bar close, legacy behaviour)")
     p.add_argument("--demand",         action="store_true",
                    help="Enable demand-layer filters (Google Trends + ETF flows)")
     p.add_argument("--demand-entry",   action="store_true",
@@ -115,6 +117,7 @@ def _override_cfg(args: argparse.Namespace) -> types.ModuleType:
     overrides.USE_MACRO_FILTER     = not args.no_macro
     overrides.USE_DEMAND_FILTER    = args.demand or args.demand_entry
     overrides.USE_DEMAND_EXIT      = args.demand or args.demand_exit
+    overrides.T_PLUS_ONE           = not args.no_t1
     return overrides
 
 
@@ -145,6 +148,7 @@ def build_report(
       f"**Mode:** {'Long/Short' if not run_cfg.LONG_ONLY else 'Long-Only'}")
     A(f"**Fees:** {run_cfg.FEE_RATE*100:.2f}%  ·  "
       f"**Slippage:** {run_cfg.SLIPPAGE*100:.2f}%  ·  "
+      f"**Execution:** {'T+1 (next-bar open)' if getattr(run_cfg, 'T_PLUS_ONE', True) else 'Same-bar close'}  ·  "
       f"**Starting capital:** ${run_cfg.INITIAL_CAPITAL:,.0f}")
     A("")
 
@@ -222,6 +226,10 @@ def build_report(
     else:
         A("- Power-law exponent is fit on all available data (look-ahead in the curve itself). Use `--walk-forward` to eliminate this.")
     A("- Z-score uses a rolling trailing window — no look-ahead in signal generation.")
+    if getattr(args, "no_t1", False):
+        A("- **Same-bar execution**: signal and execution both at close[T]. Use T+1 mode (default) for more realistic results.")
+    else:
+        A("- **T+1 execution**: signal generated at close[T], executed at open[T+1]. Eliminates same-bar execution bias.")
     A("- No tax, funding costs, or borrow fees for shorts modelled.")
     A("- Past performance of a mean-reversion model in a trending asset is not indicative of future results.")
     A("")
@@ -250,6 +258,7 @@ def main() -> None:
     print(f"  Z thresholds: buy < -{run_cfg.BUY_THRESHOLD}  ·  sell > {run_cfg.SELL_THRESHOLD}")
     print(f"  Filters     : trend={run_cfg.USE_TREND_FILTER}  volume={run_cfg.USE_VOLUME_FILTER}  macro={run_cfg.USE_MACRO_FILTER}")
     print(f"  Long-only   : {run_cfg.LONG_ONLY}")
+    print(f"  T+1 exec    : {run_cfg.T_PLUS_ONE}  (signal→next-bar-open)")
     print(f"{'─'*60}")
 
     print(f"\n  Fetching {yf_symbol} data...", flush=True)
@@ -281,8 +290,20 @@ def main() -> None:
         except Exception as exc:
             print(f"skipped ({exc})", flush=True)
 
-        # volume_df: use main price data (df has close + volume)
-        demand_components["volume_df"] = df
+        # CoinGecko volume (preferred over yfinance volume — global aggregate)
+        try:
+            from data.coingecko_fetcher import fetch_coingecko
+            print("    Fetching CoinGecko volume...", end=" ", flush=True)
+            cg_df = fetch_coingecko(symbol, end=args.end)
+            # Use CoinGecko total_volume as the volume series
+            demand_components["volume_df"] = cg_df[["total_volume"]].rename(
+                columns={"total_volume": "volume"}
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+            # Fallback: use yfinance volume from main OHLCV
+            demand_components["volume_df"] = df
 
         if demand_components:
             from models.demand_index import build_demand_index
