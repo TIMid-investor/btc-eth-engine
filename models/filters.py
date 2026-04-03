@@ -113,6 +113,62 @@ def macro_filter(
     return macro_ok
 
 
+# ── Demand filters ────────────────────────────────────────────────────────────
+
+def demand_entry_filter(demand_rising: pd.Series) -> pd.Series:
+    """
+    True when short-term demand momentum is above its long-term trend.
+
+    Only allow new entries on days when demand_short > demand_trend
+    (i.e., demand is accelerating, not decelerating).
+
+    Parameters
+    ----------
+    demand_rising : Boolean / int Series from build_demand_index()
+                    (1 = rising, 0 = falling)
+
+    Returns boolean Series named "demand_entry_ok".
+    """
+    result = demand_rising.astype(bool)
+    result.name = "demand_entry_ok"
+    return result
+
+
+def demand_exit_filter(
+    demand_short: pd.Series,
+    demand_trend: pd.Series,
+    peak_lookback: int = 10,
+) -> pd.Series:
+    """
+    True when demand has peaked and is rolling over — signals early exit.
+
+    Detection: demand_short was above demand_trend for >= `peak_lookback`
+    consecutive days, and has now crossed below it (momentum exhaustion).
+
+    Parameters
+    ----------
+    demand_short  : short-term smoothed demand (7-day EMA)
+    demand_trend  : long-term smoothed demand (30-day EMA)
+    peak_lookback : minimum days demand must have been rising before
+                    a rollover counts as a peak signal
+
+    Returns boolean Series named "demand_rolling_over" (True = exit signal).
+    """
+    rising = (demand_short > demand_trend).astype(int)
+
+    # Count consecutive rising days
+    consecutive = rising.groupby((rising != rising.shift()).cumsum()).cumcount() + 1
+    consecutive[rising == 0] = 0
+
+    # A peak rollover: was rising for >= peak_lookback days, now just crossed below
+    just_crossed_below = (rising == 0) & (rising.shift(1) == 1)
+    had_enough_history  = consecutive.shift(1).fillna(0) >= peak_lookback
+
+    rolling_over = just_crossed_below & had_enough_history
+    rolling_over.name = "demand_rolling_over"
+    return rolling_over
+
+
 # ── Composite filter ───────────────────────────────────────────────────────────
 
 def build_filter_frame(

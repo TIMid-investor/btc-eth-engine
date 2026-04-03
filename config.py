@@ -88,3 +88,40 @@ INITIAL_CAPITAL = 10_000.0
 FEE_RATE        = 0.001     # 0.10% per trade (one-way)
 SLIPPAGE        = 0.0005    # 0.05% per trade (one-way)
 START_DATE      = "2016-01-01"
+
+# ── Execution realism ──────────────────────────────────────────────────────────
+
+# Execute at next bar's open (T+1) instead of same-bar close.
+# Eliminates look-ahead on execution price; reduces CAGR slightly but is
+# more realistic for EOD strategies. Disable with --no-t1 for comparison.
+T_PLUS_ONE = True
+
+# ── Tax modeling ──────────────────────────────────────────────────────────────
+
+APPLY_TAXES      = False   # off by default; enable with --taxes flag
+TAX_SHORT_TERM   = 0.37    # federal + typical state rate for < 1 year
+TAX_LONG_TERM    = 0.20    # federal + typical state rate for >= 1 year
+
+# ── Demand index ───────────────────────────────────────────────────────────────
+
+# Enable demand-layer filters in the strategy
+USE_DEMAND_FILTER = False   # gate entries: only enter when demand is rising
+USE_DEMAND_EXIT   = False   # enhance exits: exit early when demand rolls over
+
+# Component weights for the composite demand index (auto-renormalize if a
+# component is unavailable).  Set to 0 to exclude a source entirely.
+DEMAND_W_TRENDS   = 0.25   # Google Trends composite (attention)
+DEMAND_W_VOLUME   = 0.25   # Spot dollar volume vs rolling avg (action)
+DEMAND_W_MVRV     = 0.20   # MVRV Z-score inverted (intent) — requires on-chain API
+DEMAND_W_ETF      = 0.20   # ETF dollar volume (institutional action)
+DEMAND_W_OUTFLOWS = 0.10   # Exchange outflows (accumulation intent) — requires on-chain API
+
+# Normalization window for each demand component (rolling Z-score days)
+DEMAND_NORM_WINDOW = 90
+
+# ETF tickers to track (add/remove as needed)
+ETF_TICKERS = ["IBIT", "FBTC", "ARKB", "BITB", "HODL", "GBTC"]
+
+# Google Trends queries
+TRENDS_QUERIES = ["bitcoin", "buy bitcoin", "crypto"]
+TRENDS_GEO     = ""   # "" = worldwide; "US" = United States only

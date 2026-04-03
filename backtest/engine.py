@@ -53,7 +53,7 @@ from models.power_law import (
     log_deviation,
 )
 from models.zscore import rolling_zscore
-from models.filters import build_filter_frame
+from models.filters import build_filter_frame, demand_entry_filter, demand_exit_filter
 from models.regime import build_regime_frame, apply_regime_to_target
 
 
@@ -64,6 +64,7 @@ def build_features(
     genesis_date: str,
     cfg=_default_cfg,
     use_regime: bool = False,
+    demand_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Enrich the raw OHLCV DataFrame with all model features.
@@ -106,6 +107,18 @@ def build_features(
     out["trend_mult"] = filters["trend_mult"]
     out["volume_ok"]  = filters["volume_ok"]
     out["macro_ok"]   = filters["macro_ok"]
+
+    # ── Demand index (optional) ───────────────────────────────────────────────
+    if demand_df is not None:
+        demand_aligned = demand_df.reindex(out.index)
+        if "demand_rising" in demand_df.columns:
+            out["demand_rising"] = demand_aligned["demand_rising"].fillna(1)
+        if "demand_short" in demand_df.columns:
+            out["demand_short"] = demand_aligned["demand_short"]
+        if "demand_trend" in demand_df.columns:
+            out["demand_trend"] = demand_aligned["demand_trend"]
+        if "demand_raw" in demand_df.columns:
+            out["demand_raw"] = demand_aligned["demand_raw"]
 
     # ── Target position (continuous, range [-1, 1]) ───────────────────────────
     out["target_position"] = _compute_target_position(out, cfg)
@@ -190,6 +203,19 @@ def _compute_target_position(df: pd.DataFrame, cfg) -> pd.Series:
         shock = ~df["macro_ok"].fillna(True)
         raw[shock] = 0.0
 
+    # Apply demand entry filter: block new longs when demand is falling
+    if getattr(cfg, "USE_DEMAND_FILTER", False) and "demand_rising" in df.columns:
+        demand_ok = demand_entry_filter(df["demand_rising"])
+        # Only suppress *new* entries (raw > 0 when previously flat/no signal)
+        raw[(raw > 0) & ~demand_ok] = 0.0
+
+    # Apply demand exit filter: force early exit when demand peaks and rolls over
+    if getattr(cfg, "USE_DEMAND_EXIT", False) and \
+            "demand_short" in df.columns and "demand_trend" in df.columns:
+        rolling_over = demand_exit_filter(df["demand_short"], df["demand_trend"])
+        # Exit any long position on demand rollover days
+        raw[(raw > 0) & rolling_over] = 0.0
+
     raw.name = "target_position"
     return raw
 
@@ -214,6 +240,13 @@ def run_backtest(
     -------
     equity_curve : pd.Series (daily portfolio value in $)
     trades       : pd.DataFrame with one row per closed trade
+
+    T+1 execution
+    -------------
+    When cfg.T_PLUS_ONE is True (default), signals generated on day T are
+    executed at day T+1's open price.  This eliminates same-bar look-ahead
+    on execution price and is more realistic for EOD strategies.
+    Use --no-t1 flag (or set T_PLUS_ONE=False) to restore legacy behaviour.
     """
     df = features.copy()
     if start_date:
@@ -223,10 +256,18 @@ def run_backtest(
     if df.empty:
         raise ValueError("No rows with valid Z-scores after filtering — increase history or reduce ZSCORE_MIN_PERIODS.")
 
-    capital   = cfg.INITIAL_CAPITAL
-    position  = 0.0           # current fraction of capital in crypto
-    entry_price = None
-    entry_date  = None
+    t_plus_one = getattr(cfg, "T_PLUS_ONE", True)
+    has_open   = "open" in df.columns
+
+    # T+1: shift target_position back by 1 so that the signal seen at close
+    # of day T is only acted upon at the open of day T+1.
+    if t_plus_one:
+        df["target_position"] = df["target_position"].shift(1).fillna(0.0)
+
+    capital       = cfg.INITIAL_CAPITAL
+    position      = 0.0
+    entry_price   = None
+    entry_date    = None
     entry_capital = None
 
     equity_values = []
@@ -236,6 +277,13 @@ def run_backtest(
 
     for i, (date, row) in enumerate(df.iterrows()):
         close = float(row["close"])
+
+        # Execution price: T+1 uses today's open (approximates next-bar open
+        # execution after yesterday's EOD signal); fallback to close if no open.
+        if t_plus_one and has_open and not pd.isna(row["open"]):
+            exec_price = float(row["open"])
+        else:
+            exec_price = close
 
         # ── Daily mark-to-market ──────────────────────────────────────────────
         if prev_close is not None and prev_close > 0 and position != 0.0:
@@ -271,21 +319,18 @@ def run_backtest(
 
             # Log trade entry/exit
             if position == 0.0 and target != 0.0:
-                # Opening a new trade
-                entry_price   = close
+                entry_price   = exec_price
                 entry_date    = date
                 entry_capital = capital
-                direction     = "LONG" if target > 0 else "SHORT"
 
             elif target == 0.0 and position != 0.0 and entry_date is not None:
-                # Closing a trade
                 exit_pnl = (capital - entry_capital) if entry_capital else float("nan")
                 trade_records.append({
                     "entry_date":  entry_date,
                     "exit_date":   date,
                     "direction":   "LONG" if position > 0 else "SHORT",
                     "entry_price": entry_price,
-                    "exit_price":  close,
+                    "exit_price":  exec_price,
                     "entry_z":     float(df.at[entry_date, "zscore"]) if entry_date in df.index else float("nan"),
                     "exit_z":      float(row["zscore"]),
                     "pnl":         exit_pnl,

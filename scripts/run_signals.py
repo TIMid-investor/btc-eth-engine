@@ -601,7 +601,7 @@ def _z_in_bin(z: float, label: str) -> bool:
 
 # ── Per-symbol dashboard ───────────────────────────────────────────────────────
 
-def print_dashboard(symbol: str, n_rows: int = 1) -> None:
+def print_dashboard(symbol: str, n_rows: int = 1, show_demand: bool = False) -> None:
     yf_symbol = cfg.BTC_SYMBOL if symbol == "BTC" else cfg.ETH_SYMBOL
     genesis   = cfg.BTC_GENESIS if symbol == "BTC" else cfg.ETH_GENESIS
 
@@ -656,6 +656,101 @@ def print_dashboard(symbol: str, n_rows: int = 1) -> None:
           + ("" if cfg.USE_VOLUME_FILTER else "  [disabled]"))
     print(f"    Macro OK:                {'Yes ✓' if macro_ok else 'No — shock drawdown'}"
           + ("" if cfg.USE_MACRO_FILTER else "  [disabled]"))
+
+    # Demand index (optional)
+    if show_demand:
+        print(f"")
+        print(f"  Demand Index:")
+        demand_df = None
+        demand_components: dict = {}
+        try:
+            from data.trends_fetcher import fetch_trends_composite
+            demand_components["trends_df"] = fetch_trends_composite()
+        except Exception as exc:
+            print(f"    Google Trends: unavailable ({exc})")
+
+        try:
+            from data.etf_flows_fetcher import fetch_etf_flows
+            demand_components["etf_df"] = fetch_etf_flows()
+        except Exception as exc:
+            print(f"    ETF flows: unavailable ({exc})")
+
+        # CoinGecko volume (preferred) or fallback to yfinance
+        try:
+            from data.coingecko_fetcher import fetch_coingecko
+            cg_df  = fetch_coingecko(symbol)
+            demand_components["volume_df"] = cg_df[["total_volume"]].rename(
+                columns={"total_volume": "volume"}
+            )
+        except Exception:
+            demand_components["volume_df"] = df
+
+        # On-chain: CoinMetrics MVRV + active addresses
+        try:
+            from data.onchain_fetcher import build_onchain_frame
+            demand_components["onchain_df"] = build_onchain_frame(symbol)
+        except Exception:
+            pass
+
+        # Fear & Greed Index
+        try:
+            from data.sentiment_fetcher import fetch_fear_greed
+            demand_components["fear_greed_df"] = fetch_fear_greed()
+        except Exception:
+            pass
+
+        # Multi-exchange volume (ccxt)
+        try:
+            from data.exchange_fetcher import fetch_exchange_volume
+            demand_components["exchange_df"] = fetch_exchange_volume(symbol)
+        except Exception:
+            pass
+
+        if demand_components:
+            try:
+                from models.demand_index import build_demand_index
+                demand_df = build_demand_index(**demand_components)
+                d = demand_df.iloc[-1]
+                d_raw     = d.get("demand_raw", float("nan"))
+                d_short   = d.get("demand_short", float("nan"))
+                d_trend   = d.get("demand_trend", float("nan"))
+                d_rising  = bool(d.get("demand_rising", 0))
+                print(f"    Raw score:   {d_raw:>+.3f}  {_bar(d_raw)}")
+                print(f"    7d EMA:      {d_short:>+.3f}  |  30d EMA: {d_trend:>+.3f}")
+                print(f"    Momentum:    {'↑ Rising' if d_rising else '↓ Falling'}"
+                      f"  ({'entry OK' if d_rising else 'entry BLOCKED'})")
+                component_labels = {
+                    "trends_norm":      "Google Trends",
+                    "volume_norm":      "Spot volume",
+                    "etf_norm":         "ETF flows",
+                    "mvrv_norm":        "MVRV (inv.)",
+                    "fear_greed_norm":  "Fear & Greed",
+                    "active_addr_norm": "Active addrs",
+                    "exchange_vol_norm":"Exchange vol",
+                }
+                for col, label in component_labels.items():
+                    if col in d.index and not pd.isna(d[col]):
+                        print(f"    {label:<16} {d[col]:>+.2f}σ")
+
+                # Fear & Greed raw score
+                if "fear_greed_df" in demand_components:
+                    fg_df = demand_components["fear_greed_df"]
+                    if not fg_df.empty:
+                        fg_row = fg_df.iloc[-1]
+                        fg_val = int(fg_row.get("fear_greed", 0))
+                        fg_lbl = fg_row.get("fear_greed_label", "")
+                        print(f"    F&G raw:         {fg_val}/100 ({fg_lbl})")
+
+                # MVRV if available
+                onchain_df = demand_components.get("onchain_df")
+                if onchain_df is not None and "mvrv" in onchain_df.columns:
+                    mvrv_val = float(onchain_df["mvrv"].dropna().iloc[-1])
+                    print(f"    MVRV:            {mvrv_val:.2f}"
+                          f"  {'⚠ HIGH' if mvrv_val > 3.5 else '✓ OK'}")
+            except Exception as exc:
+                print(f"    Error building demand index: {exc}")
+        else:
+            print(f"    No data sources available.")
 
     # Curve fit summary
     if cfg.CURVE_MODEL == "power_law":
@@ -718,6 +813,8 @@ def parse_args() -> argparse.Namespace:
                    help="Show only this asset (default: both)")
     p.add_argument("--days",   type=int, default=1,
                    help="Show last N days of signals in the table")
+    p.add_argument("--demand", action="store_true",
+                   help="Show demand index (Google Trends + ETF flows)")
     return p.parse_args()
 
 
@@ -726,7 +823,7 @@ def main() -> None:
     symbols = [args.symbol] if args.symbol else ["BTC", "ETH"]
     print(f"\n  Crypto Signal Dashboard — {date.today()}")
     for sym in symbols:
-        print_dashboard(sym, n_rows=args.days)
+        print_dashboard(sym, n_rows=args.days, show_demand=args.demand)
     print()
 
 

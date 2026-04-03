@@ -89,6 +89,20 @@ def parse_args() -> argparse.Namespace:
                    help="Buy on deep Z signal, hold until overbought (Z > sell_thresh) rather than exiting on mean-reversion")
     p.add_argument("--out",           default=None,
                    help="Path to write markdown report (default: reports/backtest_<SYMBOL>_<DATE>.md)")
+    p.add_argument("--taxes",          action="store_true",
+                   help="Apply capital gains tax modeling (short-term 37%%, long-term 20%%)")
+    p.add_argument("--tax-short",      type=float, default=0.37,
+                   help="Short-term capital gains rate (held < 1 year)")
+    p.add_argument("--tax-long",       type=float, default=0.20,
+                   help="Long-term capital gains rate (held >= 1 year)")
+    p.add_argument("--no-t1",          action="store_true",
+                   help="Disable T+1 execution delay (execute at same-bar close, legacy behaviour)")
+    p.add_argument("--demand",         action="store_true",
+                   help="Enable demand-layer filters (Google Trends + ETF flows)")
+    p.add_argument("--demand-entry",   action="store_true",
+                   help="Gate entries: only enter when demand is rising")
+    p.add_argument("--demand-exit",    action="store_true",
+                   help="Enhance exits: exit early when demand peaks and rolls over")
     return p.parse_args()
 
 
@@ -110,6 +124,9 @@ def _override_cfg(args: argparse.Namespace) -> types.ModuleType:
     overrides.USE_TREND_FILTER     = not args.no_trend
     overrides.USE_VOLUME_FILTER    = not args.no_volume
     overrides.USE_MACRO_FILTER     = not args.no_macro
+    overrides.USE_DEMAND_FILTER    = args.demand or args.demand_entry
+    overrides.USE_DEMAND_EXIT      = args.demand or args.demand_exit
+    overrides.T_PLUS_ONE           = not args.no_t1
     return overrides
 
 
@@ -142,6 +159,7 @@ def build_report(
       + ("  ·  **Hold-Through-Cycle: ON**" if hold_mode else ""))
     A(f"**Fees:** {run_cfg.FEE_RATE*100:.2f}%  ·  "
       f"**Slippage:** {run_cfg.SLIPPAGE*100:.2f}%  ·  "
+      f"**Execution:** {'T+1 (next-bar open)' if getattr(run_cfg, 'T_PLUS_ONE', True) else 'Same-bar close'}  ·  "
       f"**Starting capital:** ${run_cfg.INITIAL_CAPITAL:,.0f}")
     A("")
 
@@ -219,6 +237,10 @@ def build_report(
     else:
         A("- Power-law exponent is fit on all available data (look-ahead in the curve itself). Use `--walk-forward` to eliminate this.")
     A("- Z-score uses a rolling trailing window — no look-ahead in signal generation.")
+    if getattr(args, "no_t1", False):
+        A("- **Same-bar execution**: signal and execution both at close[T]. Use T+1 mode (default) for more realistic results.")
+    else:
+        A("- **T+1 execution**: signal generated at close[T], executed at open[T+1]. Eliminates same-bar execution bias.")
     A("- No tax, funding costs, or borrow fees for shorts modelled.")
     A("- Past performance of a mean-reversion model in a trending asset is not indicative of future results.")
     A("")
@@ -247,11 +269,90 @@ def main() -> None:
     print(f"  Z thresholds: buy < -{run_cfg.BUY_THRESHOLD}  ·  sell > {run_cfg.SELL_THRESHOLD}")
     print(f"  Filters     : trend={run_cfg.USE_TREND_FILTER}  volume={run_cfg.USE_VOLUME_FILTER}  macro={run_cfg.USE_MACRO_FILTER}")
     print(f"  Long-only   : {run_cfg.LONG_ONLY}")
+    print(f"  T+1 exec    : {run_cfg.T_PLUS_ONE}  (signal→next-bar-open)")
     print(f"{'─'*60}")
 
     print(f"\n  Fetching {yf_symbol} data...", flush=True)
     df = fetch_ohlcv(yf_symbol, start="2014-01-01", end=args.end)
     print(f"  {len(df)} trading days  ({df.index[0].date()} → {df.index[-1].date()})")
+
+    # ── Demand layer (optional) ──────────────────────────────────────────────
+    demand_df = None
+    use_demand = args.demand or args.demand_entry or args.demand_exit
+    if use_demand:
+        print(f"\n  Building demand index...", flush=True)
+        demand_components: dict = {}
+        try:
+            from data.trends_fetcher import fetch_trends_composite
+            print("    Fetching Google Trends...", end=" ", flush=True)
+            demand_components["trends_df"] = fetch_trends_composite(
+                start="2014-01-01", end=args.end,
+                geo=getattr(run_cfg, "TRENDS_GEO", ""),
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        try:
+            from data.etf_flows_fetcher import fetch_etf_flows
+            print("    Fetching ETF flows...", end=" ", flush=True)
+            demand_components["etf_df"] = fetch_etf_flows(end=args.end)
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        # CoinGecko volume (preferred over yfinance volume — global aggregate)
+        try:
+            from data.coingecko_fetcher import fetch_coingecko
+            print("    Fetching CoinGecko volume...", end=" ", flush=True)
+            cg_df = fetch_coingecko(symbol, end=args.end)
+            demand_components["volume_df"] = cg_df[["total_volume"]].rename(
+                columns={"total_volume": "volume"}
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+            demand_components["volume_df"] = df
+
+        try:
+            from data.onchain_fetcher import build_onchain_frame
+            print("    Fetching on-chain metrics (CoinMetrics + Blockchain.com)...",
+                  end=" ", flush=True)
+            demand_components["onchain_df"] = build_onchain_frame(
+                symbol, end=args.end
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        try:
+            from data.sentiment_fetcher import fetch_fear_greed
+            print("    Fetching Fear & Greed Index...", end=" ", flush=True)
+            demand_components["fear_greed_df"] = fetch_fear_greed(end=args.end)
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        try:
+            from data.exchange_fetcher import fetch_exchange_volume
+            print("    Fetching multi-exchange volume (ccxt)...", end=" ", flush=True)
+            demand_components["exchange_df"] = fetch_exchange_volume(
+                symbol, end=args.end
+            )
+            print("done", flush=True)
+        except Exception as exc:
+            print(f"skipped ({exc})", flush=True)
+
+        if demand_components:
+            from models.demand_index import build_demand_index
+            demand_df = build_demand_index(**demand_components)
+            d_latest = demand_df.iloc[-1]
+            print(f"  Demand index built: {len(demand_df)} days  "
+                  f"raw={d_latest.get('demand_raw', float('nan')):.2f}  "
+                  f"rising={'Yes' if d_latest.get('demand_rising', 0) else 'No'}")
+        else:
+            print("  No demand components available — skipping demand layer.")
+            use_demand = False
 
     use_regime = args.regime
 
@@ -261,6 +362,19 @@ def main() -> None:
             df, genesis_date=genesis, cfg=run_cfg,
             refit_months=args.refit_months,
         )
+        # Demand layer is applied after walk-forward feature build
+        if demand_df is not None:
+            from backtest.engine import _compute_target_position
+            demand_aligned = demand_df.reindex(features.index)
+            if "demand_rising" in demand_df.columns:
+                features["demand_rising"] = demand_aligned["demand_rising"].fillna(1)
+            if "demand_short" in demand_df.columns:
+                features["demand_short"] = demand_aligned["demand_short"]
+            if "demand_trend" in demand_df.columns:
+                features["demand_trend"] = demand_aligned["demand_trend"]
+            if "demand_raw" in demand_df.columns:
+                features["demand_raw"] = demand_aligned["demand_raw"]
+            features["target_position"] = _compute_target_position(features, run_cfg)
         print(f"  {features['curve_fit_date'].nunique()} unique curve fits applied")
         if use_regime:
             # Apply regime layer on top of walk-forward features
@@ -279,7 +393,7 @@ def main() -> None:
         print(f"  Building features ({run_cfg.CURVE_MODEL} curve"
               + (", regime-aware" if use_regime else "") + ")...", flush=True)
         features = build_features(df, genesis_date=genesis, cfg=run_cfg,
-                                  use_regime=use_regime)
+                                  use_regime=use_regime, demand_df=demand_df)
         if run_cfg.CURVE_MODEL == "power_law" and not walk_forward:
             from models.power_law import fit_power_law as _fp
             params = _fp(features["close"], genesis)
@@ -313,6 +427,22 @@ def main() -> None:
                         bench_label="Buy & Hold"))
 
     print(f"\n  Closed trades: {len(trades)}")
+
+    # ── Tax modeling (optional) ──────────────────────────────────────────────
+    if args.taxes and not trades.empty:
+        from backtest.tax import apply_taxes, tax_summary
+        print(f"\n  Applying tax model "
+              f"(ST={args.tax_short*100:.0f}%, LT={args.tax_long*100:.0f}%)...",
+              flush=True)
+        after_tax_equity, tax_log = apply_taxes(
+            equity, trades,
+            initial_capital=run_cfg.INITIAL_CAPITAL,
+            short_term_rate=args.tax_short,
+            long_term_rate=args.tax_long,
+        )
+        print(f"\n{tax_summary(equity, after_tax_equity, bah, tax_log,
+                               run_cfg.INITIAL_CAPITAL,
+                               args.tax_short, args.tax_long)}")
 
     # ── Save report ──────────────────────────────────────────────────────────
     out_path = Path(args.out) if args.out else (
