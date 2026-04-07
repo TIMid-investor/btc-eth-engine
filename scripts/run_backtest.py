@@ -75,8 +75,14 @@ def parse_args() -> argparse.Namespace:
                    help="Disable volume filter")
     p.add_argument("--no-macro",      action="store_true",
                    help="Disable macro shock filter")
-    p.add_argument("--walk-forward",  action="store_true",
+    p.add_argument("--walk-forward",        action="store_true",
                    help="Use walk-forward power-law refitting (no look-ahead in curve params)")
+    p.add_argument("--walk-forward-params", action="store_true",
+                   help="Walk-forward threshold selection: also grid-searches BUY/SELL thresholds "
+                        "on trailing 2 years at each refit.  Tests whether thresholds are robust "
+                        "or data-mined.  Implies --walk-forward.")
+    p.add_argument("--wfp-train-years",  type=float, default=2.0,
+                   help="Training window (years) for walk-forward threshold selection")
     p.add_argument("--refit-months",  type=int, default=3,
                    help="Months between curve refits in walk-forward mode")
     p.add_argument("--regime",        action="store_true",
@@ -90,13 +96,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out",           default=None,
                    help="Path to write markdown report (default: reports/backtest_<SYMBOL>_<DATE>.md)")
     p.add_argument("--taxes",          action="store_true",
-                   help="Apply capital gains tax modeling (short-term 37%%, long-term 20%%)")
-    p.add_argument("--tax-short",      type=float, default=0.37,
-                   help="Short-term capital gains rate (held < 1 year)")
-    p.add_argument("--tax-long",       type=float, default=0.20,
-                   help="Long-term capital gains rate (held >= 1 year)")
+                   help="Apply capital gains tax modeling")
+    p.add_argument("--tax-short",      type=float, default=cfg.TAX_SHORT_TERM,
+                   help="Federal short-term capital gains rate (held < 1 year)")
+    p.add_argument("--tax-long",       type=float, default=cfg.TAX_LONG_TERM,
+                   help="Federal long-term capital gains rate (held >= 1 year)")
+    p.add_argument("--tax-niit",       type=float, default=cfg.TAX_NIIT_RATE,
+                   help="Net Investment Income Tax rate (3.8%% default; set 0 if below threshold)")
+    p.add_argument("--tax-state",      type=float, default=cfg.TAX_STATE_RATE,
+                   help="State tax rate (e.g. 0.133 for CA, 0.109 for NY, 0 for TX)")
     p.add_argument("--no-t1",          action="store_true",
                    help="Disable T+1 execution delay (execute at same-bar close, legacy behaviour)")
+    p.add_argument("--curve-compare",  action="store_true",
+                   help="Run three parallel backtests (power_law / log_ema / rolling_median) "
+                        "and print results side-by-side.  Tests whether results are robust "
+                        "to the curve specification or driven by power-law curve-fitting.")
     p.add_argument("--demand",         action="store_true",
                    help="Enable demand-layer filters (Google Trends + ETF flows)")
     p.add_argument("--demand-entry",   action="store_true",
@@ -140,6 +154,7 @@ def build_report(
     equity: pd.Series,
     trades: pd.DataFrame,
     bah: pd.Series,
+    open_trade: dict | None = None,
 ) -> str:
     lines: list[str] = []
     A = lines.append
@@ -174,6 +189,24 @@ def build_report(
 
     A("## Trade Log")
     A("")
+    if open_trade:
+        ot = open_trade
+        A("### Open Position (unrealized — excluded from win-rate and trade stats)")
+        A("")
+        A(f"| Field | Value |")
+        A(f"|---|---|")
+        A(f"| Direction | {ot['direction']} |")
+        A(f"| Entry date | {str(ot['entry_date'])[:10]} |")
+        A(f"| Entry price | ${ot['entry_price']:,.0f} |")
+        A(f"| Entry Z | {ot['entry_z']:+.2f} |")
+        A(f"| Last price | ${ot['last_price']:,.0f} |")
+        A(f"| Current Z | {ot['current_z']:+.2f} |")
+        A(f"| Position size | {ot['position_size']*100:.0f}% |")
+        A(f"| Unrealized P&L | ${ot['unrealized_pnl']:+,.0f} ({ot['unrealized_pct']*100:+.1f}%) |")
+        A("")
+        A("> **Note**: Win rate and profit factor above reflect *closed* trades only. "
+          "This open position is unresolved and its final outcome is unknown.")
+        A("")
     if trades.empty:
         A("*No completed trades in this period.*")
     else:
@@ -258,11 +291,13 @@ def main() -> None:
     yf_symbol = cfg.BTC_SYMBOL if symbol == "BTC" else cfg.ETH_SYMBOL
     genesis   = cfg.BTC_GENESIS if symbol == "BTC" else cfg.ETH_GENESIS
 
-    walk_forward = args.walk_forward
+    walk_forward        = args.walk_forward or args.walk_forward_params
+    walk_forward_params = args.walk_forward_params
 
+    wf_tag = (" [WALK-FORWARD+PARAMS]" if walk_forward_params
+              else " [WALK-FORWARD]" if walk_forward else "")
     print(f"\n{'═'*60}")
-    print(f"  {symbol} Swing Trading Backtest"
-          + (" [WALK-FORWARD]" if walk_forward else ""))
+    print(f"  {symbol} Swing Trading Backtest" + wf_tag)
     print(f"{'═'*60}")
     print(f"  Curve model : {run_cfg.CURVE_MODEL}"
           + (f"  (refit every {args.refit_months}mo)" if walk_forward else " (full-history fit)"))
@@ -356,7 +391,29 @@ def main() -> None:
 
     use_regime = args.regime
 
-    if walk_forward:
+    if walk_forward_params:
+        print(f"  Building walk-forward features + threshold selection "
+              f"(train window {args.wfp_train_years:.1f}y, refit every {args.refit_months}mo)...",
+              flush=True)
+        from backtest.engine import build_features_walk_forward_params
+        features, threshold_log = build_features_walk_forward_params(
+            df, genesis_date=genesis, cfg=run_cfg,
+            refit_months=args.refit_months,
+            train_years=args.wfp_train_years,
+        )
+        if not threshold_log.empty:
+            print(f"  Threshold log ({len(threshold_log)} refit windows):")
+            print(f"  {'Fit date':>12} {'Buy Z':>7} {'Sell Z':>8} {'Train Sharpe':>13}")
+            print(f"  {'─'*12} {'─'*7} {'─'*8} {'─'*13}")
+            for _, r in threshold_log.iterrows():
+                print(f"  {str(r['fit_date'])[:10]:>12} {r['buy_z']:>7.1f} "
+                      f"{r['sell_z']:>8.1f} {r['train_sharpe']:>13.2f}")
+            buy_z_values = threshold_log["buy_z"].values
+            print(f"\n  Buy-Z range: {buy_z_values.min():.1f} – {buy_z_values.max():.1f}  "
+                  f"(std {buy_z_values.std():.2f})  "
+                  + ("→ STABLE (threshold likely real)" if buy_z_values.std() < 0.4
+                     else "→ VARIABLE (threshold may be noise)"))
+    elif walk_forward:
         print(f"  Building walk-forward features (quarterly refits)...", flush=True)
         features = build_features_walk_forward(
             df, genesis_date=genesis, cfg=run_cfg,
@@ -408,12 +465,12 @@ def main() -> None:
     print(f"\n  Running backtest from {args.start}"
           + (" [ML overlay]" if args.ml else "") + "...", flush=True)
     if args.ml:
-        equity, trades, conf_log = run_backtest_with_ml(
+        equity, trades, open_trade, conf_log = run_backtest_with_ml(
             features, cfg=run_cfg, start_date=args.start,
             confidence_threshold=args.ml_threshold,
         )
     else:
-        equity, trades = run_backtest(features, cfg=run_cfg, start_date=args.start)
+        equity, trades, open_trade = run_backtest(features, cfg=run_cfg, start_date=args.start)
     bah            = buy_and_hold(features, cfg=run_cfg, start_date=args.start)
 
     # Align buy-and-hold to strategy dates
@@ -428,28 +485,123 @@ def main() -> None:
 
     print(f"\n  Closed trades: {len(trades)}")
 
+    # ── Open / unrealized trade ───────────────────────────────────────────────
+    if open_trade:
+        ot = open_trade
+        print(f"\n  ⚠  OPEN POSITION (unrealized — not in win-rate / trade stats):")
+        print(f"     Direction  : {ot['direction']}")
+        print(f"     Entry date : {str(ot['entry_date'])[:10]}")
+        print(f"     Entry price: ${ot['entry_price']:>12,.0f}   entry Z: {ot['entry_z']:+.2f}")
+        print(f"     Last price : ${ot['last_price']:>12,.0f}   current Z: {ot['current_z']:+.2f}")
+        print(f"     Position   : {ot['position_size']*100:.0f}% of capital")
+        print(f"     Unrealized : ${ot['unrealized_pnl']:>+12,.0f}  ({ot['unrealized_pct']*100:+.1f}%)")
+
     # ── Tax modeling (optional) ──────────────────────────────────────────────
     if args.taxes and not trades.empty:
         from backtest.tax import apply_taxes, tax_summary
-        print(f"\n  Applying tax model "
-              f"(ST={args.tax_short*100:.0f}%, LT={args.tax_long*100:.0f}%)...",
-              flush=True)
+        # Composite effective rates = federal + state + NIIT (capped at 95%)
+        eff_short = min(args.tax_short + args.tax_state + args.tax_niit, 0.95)
+        eff_long  = min(args.tax_long  + args.tax_state + args.tax_niit, 0.95)
+        print(f"\n  Applying tax model:")
+        print(f"    Short-term: {args.tax_short*100:.1f}% federal "
+              f"+ {args.tax_state*100:.1f}% state "
+              f"+ {args.tax_niit*100:.1f}% NIIT "
+              f"= {eff_short*100:.1f}% effective")
+        print(f"    Long-term:  {args.tax_long*100:.1f}% federal "
+              f"+ {args.tax_state*100:.1f}% state "
+              f"+ {args.tax_niit*100:.1f}% NIIT "
+              f"= {eff_long*100:.1f}% effective")
         after_tax_equity, tax_log = apply_taxes(
             equity, trades,
             initial_capital=run_cfg.INITIAL_CAPITAL,
-            short_term_rate=args.tax_short,
-            long_term_rate=args.tax_long,
+            short_term_rate=eff_short,
+            long_term_rate=eff_long,
         )
-        print(f"\n{tax_summary(equity, after_tax_equity, bah, tax_log,
-                               run_cfg.INITIAL_CAPITAL,
-                               args.tax_short, args.tax_long)}")
+        _tax_tbl = tax_summary(equity, after_tax_equity, bah, tax_log,
+                               run_cfg.INITIAL_CAPITAL, eff_short, eff_long)
+        print(f"\n{_tax_tbl}")
+
+    # ── Multi-curve robustness test (--curve-compare) ────────────────────────
+    if getattr(args, "curve_compare", False):
+        from models.power_law import expected_price_rolling_median
+        _curve_results: list[dict] = []
+        for _curve_name in ["power_law", "log_ema", "rolling_median"]:
+            try:
+                import types as _types
+                _ccfg = _types.ModuleType("cc_cfg")
+                _ccfg.__dict__.update({k: v for k, v in vars(run_cfg).items()
+                                       if not k.startswith("__")})
+                _ccfg.CURVE_MODEL = _curve_name if _curve_name != "rolling_median" else "rolling_median"
+
+                if _curve_name == "rolling_median":
+                    # Build features manually with rolling median expected price
+                    from models.zscore import rolling_zscore
+                    from models.filters import build_filter_frame
+                    _feat = df.copy()
+                    _feat["expected_price"] = expected_price_rolling_median(
+                        _feat["close"], window=run_cfg.ZSCORE_WINDOW
+                    )
+                    _feat["log_deviation"] = np.log(_feat["close"] / _feat["expected_price"])
+                    _feat["zscore"]        = rolling_zscore(
+                        _feat["log_deviation"], window=run_cfg.ZSCORE_WINDOW,
+                        min_periods=run_cfg.ZSCORE_MIN_PERIODS,
+                    )
+                    _filters = build_filter_frame(_feat["close"], _feat["volume"], _ccfg)
+                    for _col in _filters.columns:
+                        _feat[_col] = _filters[_col]
+                    from backtest.engine import _compute_target_position
+                    _feat["target_position"] = _compute_target_position(_feat, _ccfg)
+                    _feat["curve_params_b"]  = float("nan")
+                else:
+                    _ccfg.CURVE_MODEL = _curve_name
+                    _feat = build_features(df, genesis_date=genesis, cfg=_ccfg)
+
+                _eq, _tr, _ot = run_backtest(_feat, cfg=_ccfg, start_date=args.start)
+                _bah = buy_and_hold(_feat, cfg=_ccfg, start_date=args.start)
+                _bah = _bah.reindex(_eq.index).ffill()
+                _bah = _bah / _bah.iloc[0] * run_cfg.INITIAL_CAPITAL
+                from backtest.metrics import cagr as _cagr, sharpe_ratio as _sharpe, max_drawdown as _mdd, win_rate as _wr
+                _curve_results.append({
+                    "curve":   _curve_name,
+                    "cagr":    _cagr(_eq),
+                    "sharpe":  _sharpe(_eq),
+                    "max_dd":  _mdd(_eq),
+                    "win_rate":_wr(_tr),
+                    "trades":  len(_tr),
+                    "open":    "YES" if _ot else "no",
+                })
+            except Exception as _exc:
+                _curve_results.append({"curve": _curve_name, "error": str(_exc)})
+
+        print(f"\n{'─'*70}")
+        print(f"  CURVE ROBUSTNESS COMPARISON  (same thresholds, filters, dates)")
+        print(f"{'─'*70}")
+        _hdr = f"  {'Curve':<18} {'CAGR':>8} {'Sharpe':>8} {'MaxDD':>8} {'WinRate':>8} {'Trades':>7} {'Open':>5}"
+        print(_hdr)
+        print(f"  {'─'*18} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*7} {'─'*5}")
+        for _r in _curve_results:
+            if "error" in _r:
+                print(f"  {_r['curve']:<18} ERROR: {_r['error']}")
+            else:
+                _wr_str = f"{_r['win_rate']*100:.0f}%" if not np.isnan(_r.get('win_rate', float('nan'))) else "N/A"
+                print(f"  {_r['curve']:<18} "
+                      f"{_r['cagr']*100:>+7.1f}% "
+                      f"{_r['sharpe']:>8.2f} "
+                      f"{_r['max_dd']*100:>+7.1f}% "
+                      f"{_wr_str:>8} "
+                      f"{_r['trades']:>7} "
+                      f"{_r['open']:>5}")
+        print(f"{'─'*70}")
+        print(f"  If Sharpe collapses on log_ema / rolling_median: results are")
+        print(f"  driven by power-law curve-fitting, not by the mean-reversion signal.")
+        print(f"{'─'*70}")
 
     # ── Save report ──────────────────────────────────────────────────────────
     out_path = Path(args.out) if args.out else (
         ROOT / "reports" / f"backtest_{symbol}_{date.today()}.md"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    report = build_report(symbol, args, run_cfg, features, equity, trades, bah)
+    report = build_report(symbol, args, run_cfg, features, equity, trades, bah, open_trade)
     out_path.write_text(report)
     print(f"\n  Report saved → {out_path}")
 

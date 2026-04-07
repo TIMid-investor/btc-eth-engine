@@ -31,6 +31,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DATA_CACHE
+from data.cache_utils import (load_cache as _load_cache, save_cache as _save_cache,
+                               filter_dates as _filter_dates, get_last_date as _get_last_date)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -70,11 +72,21 @@ def fetch_trends(
     end = end or str(date.today())
     cache_path = _cache_path(query, geo)
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= _CACHE_STALE_DAYS:
-            return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+
+    # Load cache for merge/fallback if not yet loaded
+    if cached is None:
+        cached = _load_cache(cache_path)
 
     # Fetch from Google Trends
     df = _download_trends(query, start, end, geo, retries)
@@ -237,25 +249,4 @@ def _cache_path(query: str, geo: str) -> Path:
     return DATA_CACHE / f"trends_{safe_query}{geo_suffix}.parquet"
 
 
-def _load_cache(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path)
-        df.index = pd.to_datetime(df.index).normalize()
-        df.index.name = "date"
-        return df
-    except Exception:
-        return None
-
-
-def _save_cache(df: pd.DataFrame, path: Path) -> None:
-    try:
-        df.to_parquet(path)
-    except Exception as exc:
-        print(f"  [trends] cache write failed: {exc}", flush=True)
-
-
-def _filter_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-    return df.loc[mask].copy()
+# _load_cache, _save_cache, _filter_dates imported from data.cache_utils above

@@ -175,8 +175,8 @@ def run_param_sensitivity(
                 override.BUY_THRESHOLD = cfg.BUY_THRESHOLD + bzo
 
                 try:
-                    equity, trades = run_backtest(features, cfg=override,
-                                                  start_date=start_date)
+                    equity, trades, _open = run_backtest(features, cfg=override,
+                                                         start_date=start_date)
                     if equity.empty:
                         continue
                     records.append({

@@ -93,24 +93,38 @@ def volume_filter(
 
 def macro_filter(
     prices: pd.Series,
-    drawdown_threshold: float = -0.40,
+    dd_soft: float = -0.20,
+    dd_hard: float = -0.50,
     window: int = 90,
 ) -> pd.Series:
     """
-    True when the asset is NOT in a severe macro drawdown.
+    Continuous position-size multiplier based on asset drawdown from recent high.
 
-    During a rapid -40%+ decline from a recent high the move is more
-    likely driven by macro contagion (credit event, exchange collapse,
-    etc.) than by mean-reversion around the long-run growth curve.
-    Blocking trades in those periods reduces catching falling knives.
+    Returns a Series in [0.0, 1.0] named "macro_mult":
+      - 1.0  when drawdown is above dd_soft  (no suppression)
+      - 0.0  when drawdown is at or below dd_hard (fully suppressed)
+      - linearly interpolated in between
 
-    Returns boolean Series named "macro_ok".
+    This replaces the previous binary gate at -40% which would have nearly
+    blocked the March 2020 BTC entry (drawdown ~-41% on the signal day).
+    A continuous scale-down is more robust to threshold sensitivity.
+
+    Parameters
+    ----------
+    prices   : asset close price Series
+    dd_soft  : drawdown level at which scaling starts (e.g. -0.20 = -20%)
+    dd_hard  : drawdown level at which position reaches zero (e.g. -0.50 = -50%)
+    window   : rolling window for computing the high
     """
     roll_high = prices.rolling(window=window, min_periods=1).max()
-    drawdown  = prices / roll_high - 1.0
-    macro_ok  = drawdown > drawdown_threshold
-    macro_ok.name = "macro_ok"
-    return macro_ok
+    drawdown  = prices / roll_high - 1.0          # 0.0 at high, negative below
+    # Linear interpolation: 1.0 at dd_soft, 0.0 at dd_hard
+    span      = dd_hard - dd_soft                  # negative span
+    mult      = ((drawdown - dd_soft) / span).clip(0.0, 1.0)
+    # Invert: high drawdown → low mult
+    macro_mult = 1.0 - mult
+    macro_mult.name = "macro_mult"
+    return macro_mult
 
 
 # ── Demand filters ────────────────────────────────────────────────────────────
@@ -192,8 +206,11 @@ def build_filter_frame(
     trend     = trend_filter(prices, ema_days=cfg.TREND_EMA_DAYS)
     volume_ok = volume_filter(volume, window=cfg.VOLUME_WINDOW,
                               min_ratio=cfg.VOLUME_MIN_RATIO)
-    macro_ok  = macro_filter(prices, drawdown_threshold=cfg.MACRO_DD_THRESHOLD,
-                             window=cfg.MACRO_DD_WINDOW)
+    # Support both old binary threshold config and new soft/hard config.
+    dd_soft = getattr(cfg, "MACRO_DD_SOFT", getattr(cfg, "MACRO_DD_THRESHOLD", -0.20))
+    dd_hard = getattr(cfg, "MACRO_DD_HARD", -0.50)
+    macro_mult = macro_filter(prices, dd_soft=dd_soft, dd_hard=dd_hard,
+                              window=cfg.MACRO_DD_WINDOW)
 
     trend_mult = trend_multiplier(prices, ema_days=cfg.TREND_EMA_DAYS)
 
@@ -201,5 +218,6 @@ def build_filter_frame(
         "trend":      trend,
         "trend_mult": trend_mult,
         "volume_ok":  volume_ok,
-        "macro_ok":   macro_ok,
+        "macro_ok":   macro_mult >= 0.01,  # boolean alias kept for compatibility
+        "macro_mult": macro_mult,
     })

@@ -102,7 +102,7 @@ def _run_one(
     raw = features_cache[key]
     try:
         features = build_features(raw, genesis_date=genesis, cfg=run_cfg)
-        equity, trades = run_backtest(features, cfg=run_cfg, start_date=start_date)
+        equity, trades, _open_trade = run_backtest(features, cfg=run_cfg, start_date=start_date)
         bah = buy_and_hold(features, cfg=run_cfg, start_date=start_date)
         bah = bah.reindex(equity.index).ffill()
         bah = bah / bah.iloc[0] * run_cfg.INITIAL_CAPITAL

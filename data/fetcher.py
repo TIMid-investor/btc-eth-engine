@@ -17,6 +17,8 @@ import yfinance as yf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DATA_CACHE
+from data.cache_utils import (load_cache as _load_cache, save_cache as _save_cache,
+                               filter_dates as _filter_dates, get_last_date as _get_last_date)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -43,22 +45,32 @@ def fetch_ohlcv(
     end = end or str(date.today())
     cache_path = _cache_path(symbol)
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
-        # Refresh if last bar is more than 1 calendar day old
+    # Sidecar-first freshness check — avoids parquet read for date lookup
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= 1:
-            return _filter_dates(cached, start, end)
-        # Incremental update: fetch only the missing tail
-        incremental_start = str((last_bar + timedelta(days=1)).date())
-        fresh = _download(symbol, incremental_start, end)
-        if not fresh.empty:
-            combined = pd.concat([cached, fresh])
-            combined = combined[~combined.index.duplicated(keep="last")]
-            combined.sort_index(inplace=True)
-            _save_cache(combined, cache_path)
-            return _filter_dates(combined, start, end)
-        return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+        else:
+            # Incremental update: fetch only the missing tail
+            incremental_start = str((last_bar + timedelta(days=1)).date())
+            fresh = _download(symbol, incremental_start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                if not fresh.empty:
+                    combined = pd.concat([cached, fresh])
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    combined.sort_index(inplace=True)
+                    _save_cache(combined, cache_path)
+                    return _filter_dates(combined, start, end)
+                return _filter_dates(cached, start, end)
 
     # Full download
     df = _download(symbol, start, end)
@@ -105,24 +117,4 @@ def _download(symbol: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 
-def _load_cache(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path)
-        df.index = pd.to_datetime(df.index).normalize()
-        return df
-    except Exception:
-        return None
-
-
-def _save_cache(df: pd.DataFrame, path: Path) -> None:
-    try:
-        df.to_parquet(path)
-    except Exception as exc:
-        print(f"  [fetcher] cache write failed: {exc}", flush=True)
-
-
-def _filter_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-    return df.loc[mask].copy()
+# _load_cache, _save_cache, _filter_dates imported from data.cache_utils above

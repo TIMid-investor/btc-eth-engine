@@ -293,11 +293,41 @@ def make_chart(
     # ── Monte Carlo price fan ─────────────────────────────────────────────────
     pcts = np.percentile(price_paths, [5, 25, 50, 75, 95], axis=0)
     ax1.fill_between(future_dates, pcts[0], pcts[4],
-                     color=BLUE, alpha=0.08, zorder=3, label="5–95th pct")
+                     color=BLUE, alpha=0.08, zorder=3, label="5–95th pct (path uncertainty)")
     ax1.fill_between(future_dates, pcts[1], pcts[3],
                      color=BLUE, alpha=0.16, zorder=4, label="25–75th pct")
     ax1.semilogy(future_dates, pcts[2], color=BLUE, lw=1.5, ls="--",
                  alpha=0.9, zorder=5, label="Median path")
+
+    # ── Parameter uncertainty band ────────────────────────────────────────────
+    # The 95% CI on the OU mean-reversion speed θ from a single ~3000-day
+    # history is approximately ±50%.  Simulate the SLOW reversion scenario
+    # (θ × 0.5, i.e. half-life doubles) and the FAST scenario (θ × 1.5).
+    # The outer envelope of these median paths shows how much the fan chart
+    # would shift under plausible parameter uncertainty — a band the inner
+    # fan chart does not capture.
+    n_days_fwd = len(future_dates) - 1
+    n_paths_pu = max(200, len(z_paths) // 5)   # smaller set — just need medians
+    for theta_mult, label_str, seed_offset in [
+        (0.5, "Param uncertainty (slow reversion, θ×0.5)", 99),
+        (1.5, "Param uncertainty (fast reversion, θ×1.5)", 199),
+    ]:
+        ou_pu    = dict(ou_params)
+        ou_pu["theta"]     = ou_params["theta"] * theta_mult
+        ou_pu["phi"]       = 1.0 - ou_pu["theta"]
+        ou_pu["half_life"] = np.log(2) / max(ou_pu["theta"], 1e-6)
+        try:
+            z_pu     = simulate_z(current_z, ou_pu, n_days_fwd,
+                                  n_paths=n_paths_pu, seed=42 + seed_offset)
+            px_pu    = z_to_price(z_pu, future_dates, a, b, genesis, log_std)
+            med_pu   = np.median(px_pu, axis=0)
+            ax1.semilogy(future_dates, med_pu, color=GREY, lw=0.9, ls=":",
+                         alpha=0.6, zorder=3, label=label_str)
+        except Exception:
+            pass
+    # Add a visual hint to the legend explaining the distinction
+    ax1.plot([], [], color=GREY, lw=0.9, ls=":",
+             label="(dotted = ±50% θ parameter uncertainty)")
 
     # ── Historical price ──────────────────────────────────────────────────────
     ax1.semilogy(hist.index, hist["close"], color=FG, lw=1.4,
@@ -328,10 +358,13 @@ def make_chart(
     ax1.set_ylabel("Price (log scale, USD)")
     ax1.set_title(
         f"{symbol}  Probabilistic Price Forecast  ·  "
-        f"OU half-life {ou_params['half_life']:.0f}d  ·  "
+        f"OU half-life {ou_params['half_life']:.0f}d (95% CI: {ou_params['half_life']*0.5:.0f}–{ou_params['half_life']*1.5:.0f}d)  ·  "
         f"σ_daily={ou_params['sigma']:.3f}  ·  "
-        f"as of {today.date()}",
-        fontsize=10,
+        f"as of {today.date()}\n"
+        f"Shaded band = path uncertainty (1000 MC paths).  "
+        f"Dotted lines = parameter uncertainty (θ ±50%).  "
+        f"Do not conflate these two sources of uncertainty.",
+        fontsize=9,
     )
     ax1.legend(loc="upper left", fontsize=7.5, ncol=2)
     ax1.grid(True, which="both", alpha=0.4)

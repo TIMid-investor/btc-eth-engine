@@ -127,17 +127,31 @@ def summary_table(
             return f"{v*100:+.{decimals}f}%"
         return f"{v:.{decimals}f}"
 
+    strat_cagr = cagr(strategy_equity)
+    bench_cagr = cagr(benchmark_equity)
+    strat_mdd  = max_drawdown(strategy_equity)
+    bench_mdd  = max_drawdown(benchmark_equity)
+    # Excess CAGR: positive means the strategy beat B&H; negative means it traded
+    # return for lower drawdown (the expected outcome for a mean-reversion model
+    # on a trending asset).
+    excess_cagr   = strat_cagr - bench_cagr if not (np.isnan(strat_cagr) or np.isnan(bench_cagr)) else float("nan")
+    # DD reduction: how many percentage points of max drawdown the strategy saved
+    # vs holding through every bear.  Positive = less drawdown than B&H.
+    dd_reduction  = bench_mdd - strat_mdd   if not (np.isnan(strat_mdd)  or np.isnan(bench_mdd))  else float("nan")
+
     rows = [
-        ("CAGR",            cagr(strategy_equity),        cagr(benchmark_equity),        True,  1),
-        ("Sharpe",          sharpe_ratio(strategy_equity), sharpe_ratio(benchmark_equity), False, 2),
-        ("Sortino",         sortino_ratio(strategy_equity),sortino_ratio(benchmark_equity),False, 2),
-        ("Calmar",          calmar_ratio(strategy_equity), calmar_ratio(benchmark_equity), False, 2),
-        ("Max Drawdown",    max_drawdown(strategy_equity), max_drawdown(benchmark_equity), True,  1),
-        ("Ann. Volatility", volatility(strategy_equity),   volatility(benchmark_equity),   True,  1),
-        ("Win Rate",        win_rate(trades),              float("nan"),                   True,  1),
-        ("Profit Factor",   profit_factor(trades),         float("nan"),                   False, 2),
-        ("Avg Duration(d)", avg_trade_duration(trades),    float("nan"),                   False, 1),
-        ("Trades",          float(len(trades)),             float("nan"),                   False, 0),
+        ("CAGR",             strat_cagr,                    bench_cagr,                    True,  1),
+        ("Excess CAGR",      excess_cagr,                   float("nan"),                  True,  1),
+        ("Sharpe",           sharpe_ratio(strategy_equity), sharpe_ratio(benchmark_equity), False, 2),
+        ("Sortino",          sortino_ratio(strategy_equity),sortino_ratio(benchmark_equity),False, 2),
+        ("Calmar",           calmar_ratio(strategy_equity), calmar_ratio(benchmark_equity), False, 2),
+        ("Max Drawdown",     strat_mdd,                     bench_mdd,                     True,  1),
+        ("DD Reduction",     dd_reduction,                  float("nan"),                  True,  1),
+        ("Ann. Volatility",  volatility(strategy_equity),   volatility(benchmark_equity),   True,  1),
+        ("Win Rate",         win_rate(trades),              float("nan"),                   True,  1),
+        ("Profit Factor",    profit_factor(trades),         float("nan"),                   False, 2),
+        ("Avg Duration(d)",  avg_trade_duration(trades),    float("nan"),                   False, 1),
+        ("Trades",           float(len(trades)),             float("nan"),                   False, 0),
     ]
 
     w_label = 20

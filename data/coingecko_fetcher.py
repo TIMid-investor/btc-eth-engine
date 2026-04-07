@@ -42,6 +42,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DATA_CACHE
+from data.cache_utils import (load_cache as _load_cache, save_cache as _save_cache,
+                               filter_dates as _filter_dates, get_last_date as _get_last_date)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -91,21 +93,30 @@ def fetch_coingecko(
     end     = end or str(date.today())
     cache_path = DATA_CACHE / f"coingecko_{symbol}.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= _CACHE_STALE_DAYS:
-            return _filter_dates(cached, start, end)
-        # Incremental: fetch only missing tail
-        incremental_start = str((last_bar + timedelta(days=1)).date())
-        fresh = _download_market_chart(coin_id, incremental_start, end)
-        if not fresh.empty:
-            combined = pd.concat([cached, fresh])
-            combined = combined[~combined.index.duplicated(keep="last")]
-            combined.sort_index(inplace=True)
-            _save_cache(combined, cache_path)
-            return _filter_dates(combined, start, end)
-        return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+        else:
+            incremental_start = str((last_bar + timedelta(days=1)).date())
+            fresh = _download_market_chart(coin_id, incremental_start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                if not fresh.empty:
+                    combined = pd.concat([cached, fresh])
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    combined.sort_index(inplace=True)
+                    _save_cache(combined, cache_path)
+                    return _filter_dates(combined, start, end)
+                return _filter_dates(cached, start, end)
 
     df = _download_market_chart(coin_id, start, end)
     if df.empty:
@@ -135,11 +146,20 @@ def fetch_dominance(
     end        = end or str(date.today())
     cache_path = DATA_CACHE / "coingecko_dominance.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= _CACHE_STALE_DAYS:
-            return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+
+    if cached is None:
+        cached = _load_cache(cache_path)
 
     # Fetch current dominance and append to cache
     today_row = _fetch_current_dominance()
@@ -206,6 +226,7 @@ def _parse_market_chart(data: dict) -> pd.DataFrame:
     market_caps = data.get("market_caps", [])
 
     if not prices:
+        print("  [coingecko] _parse_market_chart: response contained no price data", flush=True)
         return pd.DataFrame()
 
     def _to_series(raw: list, name: str) -> pd.Series:
@@ -274,26 +295,4 @@ def _get_with_backoff(url: str, params: dict, retries: int = 4) -> dict | None:
     return None
 
 
-def _load_cache(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path)
-        df.index = pd.to_datetime(df.index).normalize()
-        df.index.name = "date"
-        return df
-    except Exception:
-        return None
-
-
-def _save_cache(df: pd.DataFrame, path: Path) -> None:
-    DATA_CACHE.mkdir(parents=True, exist_ok=True)
-    try:
-        df.to_parquet(path)
-    except Exception as exc:
-        print(f"  [coingecko] cache write failed: {exc}", flush=True)
-
-
-def _filter_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-    return df.loc[mask].copy()
+# _load_cache, _save_cache, _filter_dates imported from data.cache_utils above

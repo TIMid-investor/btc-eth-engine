@@ -406,7 +406,7 @@ def run_symbol(symbol: str, args: argparse.Namespace, run_cfg) -> None:
     features = build_features(df, genesis_date=genesis, cfg=run_cfg)
 
     print(f"  [{symbol}] Running backtest...", flush=True)
-    equity, trades = run_backtest(features, cfg=run_cfg, start_date=args.start)
+    equity, trades, _open_trade = run_backtest(features, cfg=run_cfg, start_date=args.start)
     bah = buy_and_hold(features, cfg=run_cfg, start_date=args.start)
     bah = bah.reindex(equity.index).ffill()
     bah = bah / bah.iloc[0] * run_cfg.INITIAL_CAPITAL

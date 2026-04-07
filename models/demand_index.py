@@ -42,22 +42,17 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-
-# ── Default weights (mirrored in config.py) ────────────────────────────────────
-
-DEFAULT_WEIGHTS: dict[str, float] = {
-    "trends":      0.20,   # Google Trends composite (attention)
-    "volume":      0.15,   # Spot volume vs rolling avg (action)
-    "mvrv":        0.15,   # MVRV Z-score inverted (intent) — 0 if unavailable
-    "etf":         0.15,   # ETF dollar volume (institutional action)
-    "outflows":    0.05,   # Exchange outflows (accumulation intent) — 0 if unavailable
-    "fear_greed":  0.15,   # Fear & Greed Index momentum (sentiment)
-    "active_addr": 0.10,   # Active addresses (adoption/network usage)
-    "exchange_vol":0.05,   # Multi-exchange aggregated volume (ccxt)
-}
+# Single source of truth for demand weights lives in config.py.
+# Editing weights: change config.DEMAND_WEIGHTS — do not add weights here.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import DEMAND_WEIGHTS as DEFAULT_WEIGHTS
+from models.signal_utils import rolling_zscore as _rolling_zscore
 
 _NORM_WINDOW  = 90    # rolling Z-score window for each component
 _SHORT_EMA    = 7     # demand_short EMA span
@@ -227,19 +222,6 @@ def demand_summary(demand_df: pd.DataFrame, as_of: str | None = None) -> dict:
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
-
-def _rolling_zscore(series: pd.Series, window: int) -> pd.Series:
-    """
-    Compute trailing rolling Z-score: (x - rolling_mean) / rolling_std.
-    Uses min_periods = window // 2 to allow early signal formation.
-    """
-    min_p = max(window // 2, 14)
-    roll  = series.rolling(window=window, min_periods=min_p)
-    mu    = roll.mean()
-    sigma = roll.std()
-    z = (series - mu) / sigma.replace(0, np.nan)
-    return z
-
 
 def _union_index(series_list: list[pd.Series]) -> pd.DatetimeIndex:
     """Return the union of all DatetimeIndexes, normalized to daily."""

@@ -15,6 +15,15 @@ Two sources:
    Engagement-weighted daily sentiment score (-1 to +1)
    Set env vars: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT
 
+Reddit module call chain
+------------------------
+  data/sentiment_fetcher.py   ← THIS FILE — fetch + cache raw Reddit posts (PRAW)
+      └─ models/reddit_sentiment.py   — VADER + FinBERT scoring of post text
+      └─ models/reddit_narrative.py   — phase detection (capitulation→euphoria)
+  scripts/run_reddit.py       — terminal dashboard consuming all three
+
+  models/reddit_collector.py  — DEPRECATED predecessor to this file; do not use.
+
 Usage
 -----
     from data.sentiment_fetcher import fetch_fear_greed, fetch_reddit_sentiment
@@ -37,6 +46,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DATA_CACHE
+from data.cache_utils import (load_cache as _load_cache, save_cache as _save_cache,
+                               filter_dates as _filter_dates, get_last_date as _get_last_date)
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
@@ -75,11 +86,20 @@ def fetch_fear_greed(
     end        = end or str(date.today())
     cache_path = DATA_CACHE / "fear_greed.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= 1:
-            return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+
+    if cached is None:
+        cached = _load_cache(cache_path)
 
     df = _download_fear_greed()
     if df is None or df.empty:
@@ -182,11 +202,20 @@ def fetch_reddit_sentiment(
     symbol     = symbol.upper()
     cache_path = DATA_CACHE / f"reddit_sentiment_{symbol}.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= 1:
-            return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+
+    if cached is None:
+        cached = _load_cache(cache_path)
 
     df = _download_reddit(symbol, client_id, client_secret, user_agent,
                           posts_per_day)
@@ -295,27 +324,4 @@ def _score_text(text: str, analyzer) -> float:
 
 
 # ── Cache helpers ──────────────────────────────────────────────────────────────
-
-def _load_cache(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path)
-        df.index = pd.to_datetime(df.index).normalize()
-        df.index.name = "date"
-        return df
-    except Exception:
-        return None
-
-
-def _save_cache(df: pd.DataFrame, path: Path) -> None:
-    DATA_CACHE.mkdir(parents=True, exist_ok=True)
-    try:
-        df.to_parquet(path)
-    except Exception as exc:
-        print(f"  [sentiment] cache write failed: {exc}", flush=True)
-
-
-def _filter_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-    return df.loc[mask].copy()
+# _load_cache, _save_cache, _filter_dates imported from data.cache_utils above

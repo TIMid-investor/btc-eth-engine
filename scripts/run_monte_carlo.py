@@ -95,7 +95,7 @@ def main() -> None:
                                   use_regime=args.regime)
 
     print(f"  Running base backtest...", flush=True)
-    equity, trades = run_backtest(features, cfg=run_cfg, start_date=args.start)
+    equity, trades, _open_trade = run_backtest(features, cfg=run_cfg, start_date=args.start)
     bah            = buy_and_hold(features, cfg=run_cfg, start_date=args.start)
     bah            = bah.reindex(equity.index).ffill()
     bah            = bah / bah.iloc[0] * run_cfg.INITIAL_CAPITAL

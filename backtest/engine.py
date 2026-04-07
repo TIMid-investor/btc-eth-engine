@@ -198,10 +198,18 @@ def _compute_target_position(df: pd.DataFrame, cfg) -> pd.Series:
         low_vol = ~df["volume_ok"].fillna(True)
         raw[low_vol] = 0.0
 
-    # Apply macro filter: zero out signal during shock drawdowns
+    # Apply macro filter: scale position by continuous drawdown multiplier.
+    # macro_mult = 1.0 at shallow drawdowns, linearly → 0.0 at MACRO_DD_HARD.
+    # Replaces the old binary gate which would zero out the signal completely
+    # at the -40% threshold (nearly blocking the March 2020 BTC entry).
     if cfg.USE_MACRO_FILTER:
-        shock = ~df["macro_ok"].fillna(True)
-        raw[shock] = 0.0
+        if "macro_mult" in df.columns:
+            mult = df["macro_mult"].fillna(1.0).clip(0.0, 1.0)
+            raw = raw * mult
+        else:
+            # Fallback: old boolean column
+            shock = ~df["macro_ok"].fillna(True)
+            raw[shock] = 0.0
 
     # Apply demand entry filter: block new longs when demand is falling
     if getattr(cfg, "USE_DEMAND_FILTER", False) and "demand_rising" in df.columns:
@@ -215,6 +223,20 @@ def _compute_target_position(df: pd.DataFrame, cfg) -> pd.Series:
         rolling_over = demand_exit_filter(df["demand_short"], df["demand_trend"])
         # Exit any long position on demand rollover days
         raw[(raw > 0) & rolling_over] = 0.0
+
+    # Apply vol-targeting overlay: scale position to maintain constant portfolio vol.
+    # multiplier = min(1, VOL_TARGET / realised_annualised_vol)
+    # Uses trailing daily returns of the *asset* (close pct-change) as the vol proxy.
+    if getattr(cfg, "USE_VOL_TARGET", False) and "close" in df.columns:
+        vol_lookback = int(getattr(cfg, "VOL_LOOKBACK_DAYS", 30))
+        vol_target   = float(getattr(cfg, "VOL_TARGET_ANNUAL", 0.40))
+        daily_rets   = df["close"].pct_change().fillna(0)
+        realised_vol = (
+            daily_rets.rolling(window=vol_lookback, min_periods=max(5, vol_lookback // 4))
+            .std() * np.sqrt(252)
+        ).replace(0, np.nan).fillna(vol_target)   # fallback to target when insufficient data
+        vol_mult = (vol_target / realised_vol).clip(0.0, 1.0)
+        raw = raw * vol_mult
 
     raw.name = "target_position"
     return raw
@@ -275,6 +297,13 @@ def run_backtest(
 
     prev_close = None
 
+    # Circuit breaker state
+    max_portfolio_dd      = getattr(cfg, "MAX_PORTFOLIO_DD",      -0.60)
+    circuit_breaker_reset = getattr(cfg, "CIRCUIT_BREAKER_RESET",  0.10)
+    equity_peak           = capital
+    equity_trough         = capital
+    circuit_open          = False   # True = breaker has tripped; block new entries
+
     for i, (date, row) in enumerate(df.iterrows()):
         close = float(row["close"])
 
@@ -292,8 +321,25 @@ def run_backtest(
 
         prev_close = close
 
+        # ── Circuit breaker ───────────────────────────────────────────────────
+        # Track running peak and drawdown; trip/reset the breaker.
+        equity_peak   = max(equity_peak, capital)
+        current_dd    = (capital - equity_peak) / equity_peak  # negative number
+        if not circuit_open and current_dd <= max_portfolio_dd:
+            circuit_open  = True
+            equity_trough = capital
+        if circuit_open:
+            equity_trough = min(equity_trough, capital)
+            # Reset once we've recovered CIRCUIT_BREAKER_RESET above the trough
+            if capital >= equity_trough * (1.0 + circuit_breaker_reset):
+                circuit_open = False
+
         # ── Rebalance ─────────────────────────────────────────────────────────
         target = float(row["target_position"])
+        # When the circuit breaker is open, suppress all new entries (but allow
+        # existing positions to be exited normally — don't force a panic sell).
+        if circuit_open and target > position:
+            target = position  # hold or exit only; no new longs
 
         # Hold-through-cycle mode: override the vectorised continuous target.
         # Once in a long, stay fully invested until Z turns overbought.
@@ -355,7 +401,31 @@ def run_backtest(
                  "pnl", "pnl_pct"]
     )
 
-    return equity_curve, trades
+    # ── Open / unrealized trade ───────────────────────────────────────────────
+    # If a position is still open at the end of the simulation, capture it so
+    # callers can report the unrealized P&L and avoid misleading closed-trade
+    # statistics (e.g. a "100% win rate" that ignores a large open loser).
+    open_trade: dict | None = None
+    if entry_date is not None and entry_price is not None and position != 0.0:
+        last_date  = df.index[-1]
+        last_close = float(df["close"].iloc[-1])
+        last_z     = float(df["zscore"].iloc[-1]) if not np.isnan(df["zscore"].iloc[-1]) else float("nan")
+        unrealized_pnl = (last_close / entry_price - 1.0) * abs(position) * (entry_capital or capital)
+        unrealized_pct = (last_close / entry_price - 1.0) if entry_price else float("nan")
+        open_trade = {
+            "entry_date":     entry_date,
+            "last_date":      last_date,
+            "direction":      "LONG" if position > 0 else "SHORT",
+            "entry_price":    entry_price,
+            "last_price":     last_close,
+            "entry_z":        float(df.at[entry_date, "zscore"]) if entry_date in df.index else float("nan"),
+            "current_z":      last_z,
+            "position_size":  position,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pct": unrealized_pct,
+        }
+
+    return equity_curve, trades, open_trade
 
 
 # ── Walk-forward feature builder ─────────────────────────────────────────────
@@ -477,6 +547,137 @@ def build_features_walk_forward(
     out["walk_forward"] = True
 
     return out
+
+
+# ── Walk-forward threshold selection ─────────────────────────────────────────
+
+def build_features_walk_forward_params(
+    df: pd.DataFrame,
+    genesis_date: str,
+    cfg=_default_cfg,
+    refit_months: int = 3,
+    train_years: float = 2.0,
+    threshold_grid: list[float] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Walk-forward backtest with both curve AND threshold selected out-of-sample.
+
+    At each refit date the function:
+    1. Refits the power-law curve on trailing data (same as build_features_walk_forward).
+    2. Grid-searches BUY_THRESHOLD / SELL_THRESHOLD over the trailing `train_years`
+       of data, selecting the pair that maximised Sharpe.
+    3. Applies those thresholds forward for the next `refit_months`.
+
+    This is the correct way to test whether the 1.5 threshold is robust or
+    data-mined: if the selected threshold is consistently ~1.4–1.6 across all
+    windows, the default is validated.  If it varies from 0.8 to 2.5, it's noise.
+
+    Parameters
+    ----------
+    df              : raw OHLCV DataFrame
+    genesis_date    : ISO genesis date for power-law
+    cfg             : base config
+    refit_months    : frequency of refit (default quarterly)
+    train_years     : trailing years used to select thresholds
+    threshold_grid  : Z-score threshold values to search (default [1.0,1.5,2.0,2.5,3.0])
+
+    Returns
+    -------
+    features        : feature DataFrame (same schema as build_features_walk_forward)
+    threshold_log   : DataFrame logging selected thresholds per refit date
+    """
+    import types as _types
+
+    threshold_grid = threshold_grid or [1.0, 1.5, 2.0, 2.5, 3.0]
+
+    # Step 1: build base walk-forward features (curve params only)
+    features = build_features_walk_forward(
+        df, genesis_date=genesis_date, cfg=cfg,
+        refit_months=refit_months,
+    )
+
+    dates = features.index
+    min_train_rows = int(train_years * 252)
+    step = pd.DateOffset(months=refit_months)
+
+    # Generate refit dates (same logic as build_features_walk_forward)
+    refit_dates: list[pd.Timestamp] = []
+    first_eligible = dates[min_train_rows] if len(dates) > min_train_rows else dates[-1]
+    current = first_eligible
+    while current <= dates[-1]:
+        valid = dates[dates <= current]
+        if len(valid):
+            refit_dates.append(valid[-1])
+        current += step
+
+    threshold_records: list[dict] = []
+
+    # Overwrite target_position in rolling windows using selected thresholds
+    new_target = features["target_position"].copy()
+
+    for i, fit_date in enumerate(refit_dates):
+        apply_start = fit_date
+        apply_end   = refit_dates[i + 1] if i + 1 < len(refit_dates) else dates[-1]
+
+        train_start = fit_date - pd.DateOffset(years=train_years)
+        train_slice = features[(features.index >= train_start) & (features.index <= fit_date)]
+        if len(train_slice) < 60:
+            continue
+
+        best_sharpe  = -np.inf
+        best_buy_z   = cfg.BUY_THRESHOLD
+        best_sell_z  = cfg.SELL_THRESHOLD
+
+        for buy_z in threshold_grid:
+            for sell_z in threshold_grid:
+                try:
+                    trial_cfg = _types.ModuleType("trial")
+                    trial_cfg.__dict__.update({k: v for k, v in vars(cfg).items()
+                                               if not k.startswith("__")})
+                    trial_cfg.BUY_THRESHOLD  = buy_z
+                    trial_cfg.SELL_THRESHOLD = sell_z
+                    trial_slice = train_slice.copy()
+                    trial_slice["target_position"] = _compute_target_position(trial_slice, trial_cfg)
+                    eq, tr, _ot = run_backtest(trial_slice, cfg=trial_cfg)
+                    if eq.empty or len(eq) < 30:
+                        continue
+                    from backtest.metrics import sharpe_ratio as _sr
+                    s = _sr(eq)
+                    if not np.isnan(s) and s > best_sharpe:
+                        best_sharpe = s
+                        best_buy_z  = buy_z
+                        best_sell_z = sell_z
+                except Exception:
+                    continue
+
+        threshold_records.append({
+            "fit_date":    fit_date,
+            "apply_start": apply_start,
+            "apply_end":   apply_end,
+            "buy_z":       best_buy_z,
+            "sell_z":      best_sell_z,
+            "train_sharpe": best_sharpe,
+        })
+
+        # Apply selected thresholds to the forward window
+        apply_cfg = _types.ModuleType("apply")
+        apply_cfg.__dict__.update({k: v for k, v in vars(cfg).items()
+                                   if not k.startswith("__")})
+        apply_cfg.BUY_THRESHOLD  = best_buy_z
+        apply_cfg.SELL_THRESHOLD = best_sell_z
+        fwd_mask = (features.index >= apply_start) & (features.index <= apply_end)
+        if fwd_mask.any():
+            fwd_slice = features[fwd_mask].copy()
+            new_target[fwd_mask] = _compute_target_position(fwd_slice, apply_cfg)
+
+    features = features.copy()
+    features["target_position"] = new_target
+    features["walk_forward_params"] = True
+
+    threshold_log = pd.DataFrame(threshold_records) if threshold_records else pd.DataFrame(
+        columns=["fit_date", "apply_start", "apply_end", "buy_z", "sell_z", "train_sharpe"]
+    )
+    return features, threshold_log
 
 
 # ── Buy-and-hold benchmark ────────────────────────────────────────────────────

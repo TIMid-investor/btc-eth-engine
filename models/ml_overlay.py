@@ -348,10 +348,31 @@ def run_backtest_with_ml(
     )
     confidence_log = pd.DataFrame(confidence_records).set_index("date") if confidence_records else pd.DataFrame()
 
+    # Open / unrealized trade (mirrors engine.run_backtest behaviour)
+    import numpy as np
+    open_trade: dict | None = None
+    if entry_date is not None and entry_price is not None and position != 0.0:
+        last_date  = df.index[-1]
+        last_close = float(df["close"].iloc[-1])
+        last_z     = float(df["zscore"].iloc[-1]) if not np.isnan(df["zscore"].iloc[-1]) else float("nan")
+        unrealized_pct = (last_close / entry_price - 1.0) if entry_price else float("nan")
+        open_trade = {
+            "entry_date":     entry_date,
+            "last_date":      last_date,
+            "direction":      "LONG" if position > 0 else "SHORT",
+            "entry_price":    entry_price,
+            "last_price":     last_close,
+            "entry_z":        float(df.at[entry_date, "zscore"]) if entry_date in df.index else float("nan"),
+            "current_z":      last_z,
+            "position_size":  position,
+            "unrealized_pnl": unrealized_pct * abs(position) * (entry_capital or capital),
+            "unrealized_pct": unrealized_pct,
+        }
+
     print(f"  ML classifier: {classifier.n_trades} trades seen, "
           f"{'active' if classifier.is_ready() else 'not yet active'}")
     if classifier.is_ready() and classifier.feature_importances:
         top = sorted(classifier.feature_importances.items(), key=lambda x: -x[1])
         print(f"  Top features: " + "  ".join(f"{k}={v:.3f}" for k, v in top[:4]))
 
-    return equity_curve, trades, confidence_log
+    return equity_curve, trades, open_trade, confidence_log

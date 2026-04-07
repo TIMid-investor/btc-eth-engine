@@ -124,6 +124,33 @@ def expected_price_log_ema(
     return expected
 
 
+# ── Rolling-median alternative ────────────────────────────────────────────────
+
+def expected_price_rolling_median(
+    prices: pd.Series,
+    window: int = 365,
+) -> pd.Series:
+    """
+    Non-parametric expected price: rolling median of log(price) in price space.
+
+    No genesis date, no curve assumption.  The expected price at each point is
+    simply the median price over the trailing `window` days, computed in log
+    space (geometric median).  This is a sanity-check alternative to the power
+    law: if Z-score signals are robust when using rolling median instead of the
+    fitted curve, the strategy has some inherent validity beyond curve-fitting.
+
+    Parameters
+    ----------
+    prices : price Series indexed by pd.Timestamp
+    window : trailing window in days (default 365)
+    """
+    log_p     = np.log(prices)
+    log_med   = log_p.rolling(window=window, min_periods=window // 2).median()
+    expected  = np.exp(log_med)
+    expected.name = "expected_price"
+    return expected
+
+
 # ── Deviation (log space) ──────────────────────────────────────────────────────
 
 def log_deviation(prices: pd.Series, expected: pd.Series) -> pd.Series:

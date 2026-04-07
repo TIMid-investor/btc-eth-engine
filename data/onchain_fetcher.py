@@ -48,6 +48,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import DATA_CACHE
+from data.cache_utils import (load_cache as _load_cache, save_cache as _save_cache,
+                               filter_dates as _filter_dates, get_last_date as _get_last_date)
 
 # ── HTTP session ───────────────────────────────────────────────────────────────
 
@@ -99,20 +101,30 @@ def fetch_coinmetrics(
     end        = end or str(date.today())
     cache_path = DATA_CACHE / f"coinmetrics_{symbol}.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= 1:
-            return _filter_dates(cached, start, end)
-        incremental_start = str((last_bar + timedelta(days=1)).date())
-        fresh = _download_coinmetrics(symbol, incremental_start, end)
-        if fresh is not None and not fresh.empty:
-            combined = pd.concat([cached, fresh])
-            combined = combined[~combined.index.duplicated(keep="last")]
-            combined.sort_index(inplace=True)
-            _save_cache(combined, cache_path)
-            return _filter_dates(combined, start, end)
-        return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+        else:
+            incremental_start = str((last_bar + timedelta(days=1)).date())
+            fresh = _download_coinmetrics(symbol, incremental_start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                if fresh is not None and not fresh.empty:
+                    combined = pd.concat([cached, fresh])
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    combined.sort_index(inplace=True)
+                    _save_cache(combined, cache_path)
+                    return _filter_dates(combined, start, end)
+                return _filter_dates(cached, start, end)
 
     df = _download_coinmetrics(symbol, start, end)
     if df is None or df.empty:
@@ -195,11 +207,20 @@ def fetch_blockchain_info(
     end        = end or str(date.today())
     cache_path = DATA_CACHE / "blockchain_info.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= 1:
-            return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+
+    if cached is None:
+        cached = _load_cache(cache_path)
 
     df = _download_blockchain_info(start, end)
     if df is None or df.empty:
@@ -284,11 +305,20 @@ def fetch_etherscan(
     end        = end or str(date.today())
     cache_path = DATA_CACHE / "etherscan.parquet"
 
-    cached = _load_cache(cache_path)
-    if cached is not None and not force_refresh:
-        last_bar = cached.index.max()
+    cached   = None
+    last_bar = _get_last_date(cache_path)
+    if last_bar is None and not force_refresh:
+        cached   = _load_cache(cache_path)
+        last_bar = cached.index.max() if cached is not None else None
+    if last_bar is not None and not force_refresh:
         if (pd.Timestamp(end) - last_bar).days <= 1:
-            return _filter_dates(cached, start, end)
+            if cached is None:
+                cached = _load_cache(cache_path)
+            if cached is not None:
+                return _filter_dates(cached, start, end)
+
+    if cached is None:
+        cached = _load_cache(cache_path)
 
     df = _download_etherscan(api_key, start, end)
     if df is None or df.empty:
@@ -405,13 +435,27 @@ def build_onchain_frame(
     if not frames:
         raise RuntimeError(f"All on-chain data sources failed for {symbol}.")
 
-    # Combine on daily index (outer join — missing values stay NaN)
+    # Combine with explicit priority: first frame wins on overlapping columns.
+    # For BTC: CoinMetrics is primary (active_addresses, mvrv, etc.);
+    #          Blockchain.com fills in btc_active_addresses, btc_hash_rate.
+    # Columns unique to each source are kept; overlapping names use the
+    # first-seen (highest-priority) source and the duplicate is dropped with
+    # a log message so the choice is always visible.
     result = frames[0]
     for f in frames[1:]:
-        result = result.join(f, how="outer", rsuffix="_dup")
-        # Drop any duplicated columns from rsuffix
-        dup_cols = [c for c in result.columns if c.endswith("_dup")]
-        result.drop(columns=dup_cols, inplace=True)
+        overlap = [c for c in f.columns if c in result.columns]
+        if overlap:
+            print(
+                f"  [onchain] column overlap {overlap} — keeping first source, "
+                f"dropping from later source",
+                flush=True,
+            )
+            f = f.drop(columns=overlap)
+        new_cols = [c for c in f.columns if c not in result.columns]
+        if new_cols:
+            print(f"  [onchain] adding columns from secondary source: {new_cols}",
+                  flush=True)
+        result = result.join(f[new_cols] if new_cols else f, how="outer")
 
     result.sort_index(inplace=True)
     return result
@@ -441,26 +485,4 @@ def _get_with_backoff(url: str, params: dict, retries: int = 4) -> dict | None:
     return None
 
 
-def _load_cache(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_parquet(path)
-        df.index = pd.to_datetime(df.index).normalize()
-        df.index.name = "date"
-        return df
-    except Exception:
-        return None
-
-
-def _save_cache(df: pd.DataFrame, path: Path) -> None:
-    DATA_CACHE.mkdir(parents=True, exist_ok=True)
-    try:
-        df.to_parquet(path)
-    except Exception as exc:
-        print(f"  [onchain] cache write failed: {exc}", flush=True)
-
-
-def _filter_dates(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    mask = (df.index >= pd.Timestamp(start)) & (df.index <= pd.Timestamp(end))
-    return df.loc[mask].copy()
+# _load_cache, _save_cache, _filter_dates imported from data.cache_utils above
