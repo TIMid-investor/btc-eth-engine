@@ -25,6 +25,7 @@ Usage
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -46,6 +47,18 @@ def get_last_date(cache_path: Path) -> pd.Timestamp | None:
     try:
         data = json.loads(meta.read_text())
         return pd.Timestamp(data["last_date"])
+    except Exception:
+        return None
+
+
+def get_fetched_at(cache_path: Path) -> datetime | None:
+    """Return the wall-clock UTC time the cache was last written, or None."""
+    meta = _meta_path(cache_path)
+    if not meta.exists():
+        return None
+    try:
+        data = json.loads(meta.read_text())
+        return datetime.fromisoformat(data["fetched_at"])
     except Exception:
         return None
 
@@ -82,8 +95,9 @@ def save_cache(df: pd.DataFrame, path: Path) -> None:
         # Write sidecar so freshness checks are O(1)
         last_date = df.index.max()
         meta = {
-            "last_date": str(last_date.date()) if hasattr(last_date, "date") else str(last_date)[:10],
-            "rows": len(df),
+            "last_date":  str(last_date.date()) if hasattr(last_date, "date") else str(last_date)[:10],
+            "rows":       len(df),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
         _meta_path(path).write_text(json.dumps(meta))
     except Exception as exc:

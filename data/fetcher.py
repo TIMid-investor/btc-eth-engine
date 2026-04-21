@@ -52,10 +52,11 @@ def fetch_ohlcv(
         cached   = _load_cache(cache_path)
         last_bar = cached.index.max() if cached is not None else None
     if last_bar is not None and not force_refresh:
-        if (pd.Timestamp(end) - last_bar).days <= 1:
+        if (pd.Timestamp(end) - last_bar).days < 1:
             if cached is None:
                 cached = _load_cache(cache_path)
             if cached is not None:
+                _save_cache(cached, cache_path)
                 return _filter_dates(cached, start, end)
         else:
             # Incremental update: fetch only the missing tail
@@ -70,6 +71,7 @@ def fetch_ohlcv(
                     combined.sort_index(inplace=True)
                     _save_cache(combined, cache_path)
                     return _filter_dates(combined, start, end)
+                _save_cache(cached, cache_path)
                 return _filter_dates(cached, start, end)
 
     # Full download
@@ -94,7 +96,7 @@ def _download(symbol: str, start: str, end: str) -> pd.DataFrame:
         raw = yf.download(
             symbol,
             start=start,
-            end=end,
+            end=str((pd.Timestamp(end) + pd.Timedelta(days=1)).date()),
             auto_adjust=True,
             progress=False,
         )
